@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/keelfit.svg)](https://pypi.org/project/keelfit/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Stars](https://img.shields.io/github/stars/yourusername/keelfit.svg)](https://github.com/yourusername/keelfit)
+[![Stars](https://img.shields.io/github/stars/arths17/keel.svg)](https://github.com/arths17/keel)
 
 **Keep your models balanced.**  
 Continuous fine-tuning with automatic forgetting detection and skill rollback.
