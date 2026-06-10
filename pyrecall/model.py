@@ -82,6 +82,9 @@ class Model:
         forgetting_threshold: float = 0.10,
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
+        learning_rate: float = 2e-4,
+        batch_size: int = 4,
+        max_length: int = 512,
     ) -> None:
         """
         Load *model_name* from HuggingFace Hub (or local cache) and wrap it with LoRA.
@@ -97,6 +100,9 @@ class Model:
             forgetting_threshold: Score drop fraction that counts as forgetting (0–1).
             load_in_4bit: Load base model in 4-bit (QLoRA). Requires ``bitsandbytes``.
             load_in_8bit: Load base model in 8-bit. Requires ``bitsandbytes``.
+            learning_rate: Default AdamW learning rate used by :meth:`learn`.
+            batch_size: Default per-device training batch size used by :meth:`learn`.
+            max_length: Default tokenisation truncation length used by :meth:`learn`.
         """
         if strategy not in ("lora", "qlora"):
             raise PyrecallError(
@@ -108,6 +114,9 @@ class Model:
         self.model_name = model_name
         self.strategy = strategy
         self.device = device or self._best_device()
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.max_length = max_length
 
         self._baseline_snapshot_name: Optional[str] = None
 
@@ -203,9 +212,9 @@ class Model:
         self,
         data_path: str,
         epochs: int = 3,
-        batch_size: int = 4,
-        learning_rate: float = 2e-4,
-        max_length: int = 512,
+        batch_size: Optional[int] = None,
+        learning_rate: Optional[float] = None,
+        max_length: Optional[int] = None,
         resume: bool = False,
     ) -> None:
         """
@@ -229,6 +238,10 @@ class Model:
             max_length: Tokenisation truncation length.
             resume: If True, resume from the latest saved checkpoint (if one exists).
         """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        learning_rate = learning_rate if learning_rate is not None else self.learning_rate
+        max_length = max_length if max_length is not None else self.max_length
+
         data_file = Path(data_path)
         if not data_file.exists():
             raise PyrecallError(

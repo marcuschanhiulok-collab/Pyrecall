@@ -186,6 +186,97 @@ class TestModelCheck:
         assert len(report.comparisons) > 0
 
 
+class TestModelConstructorDefaults:
+    def test_constructor_defaults_stored(self, patched_model) -> None:
+        assert patched_model.learning_rate == 2e-4
+        assert patched_model.batch_size == 4
+        assert patched_model.max_length == 512
+
+    def test_custom_constructor_defaults_stored(self, tmp_snapshot_dir: Path) -> None:
+        mock_tok = _make_mock_tokenizer()
+        mock_base = _make_mock_base_model()
+        mock_peft = _make_mock_peft_model()
+
+        with (
+            patch("pyrecall.model.AutoTokenizer.from_pretrained", return_value=mock_tok),
+            patch("pyrecall.model.AutoModelForCausalLM.from_pretrained", return_value=mock_base),
+            patch("pyrecall.model.get_peft_model", return_value=mock_peft),
+        ):
+            from pyrecall.model import Model
+
+            m = Model(
+                "test/model",
+                learning_rate=1e-3,
+                batch_size=8,
+                max_length=256,
+                snapshot_dir=tmp_snapshot_dir,
+            )
+        assert m.learning_rate == 1e-3
+        assert m.batch_size == 8
+        assert m.max_length == 256
+
+    def test_learn_uses_constructor_defaults(self, patched_model, tmp_path: Path) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+
+        patched_model.learning_rate = 5e-5
+        patched_model.batch_size = 2
+        patched_model.max_length = 128
+
+        captured_args: dict = {}
+
+        def capture_args(**kwargs):
+            captured_args.update(kwargs)
+            return MagicMock()
+
+        mock_trainer = MagicMock()
+        with (
+            patch("pyrecall.model.load_dataset") as mock_ds,
+            patch("pyrecall.model.Trainer", return_value=mock_trainer),
+            patch("pyrecall.model.TrainingArguments", side_effect=capture_args),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            mock_dataset = MagicMock()
+            mock_dataset.column_names = ["text"]
+            mock_dataset.map.return_value = mock_dataset
+            mock_ds.return_value = mock_dataset
+
+            patched_model.learn(str(data_file))
+
+        assert captured_args.get("learning_rate") == 5e-5
+        assert captured_args.get("per_device_train_batch_size") == 2
+
+    def test_learn_explicit_args_override_constructor_defaults(
+        self, patched_model, tmp_path: Path
+    ) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+
+        patched_model.learning_rate = 5e-5
+
+        captured_args: dict = {}
+
+        def capture_args(**kwargs):
+            captured_args.update(kwargs)
+            return MagicMock()
+
+        mock_trainer = MagicMock()
+        with (
+            patch("pyrecall.model.load_dataset") as mock_ds,
+            patch("pyrecall.model.Trainer", return_value=mock_trainer),
+            patch("pyrecall.model.TrainingArguments", side_effect=capture_args),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            mock_dataset = MagicMock()
+            mock_dataset.column_names = ["text"]
+            mock_dataset.map.return_value = mock_dataset
+            mock_ds.return_value = mock_dataset
+
+            patched_model.learn(str(data_file), learning_rate=3e-4)
+
+        assert captured_args.get("learning_rate") == 3e-4
+
+
 class TestModelLearn:
     def test_learn_raises_for_missing_file(self, patched_model) -> None:
         from pyrecall.model import PyrecallError
