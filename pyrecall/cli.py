@@ -68,8 +68,36 @@ def init(
     ] = "meta-llama/Llama-3.2-1B",
     strategy: Annotated[
         str,
-        typer.Option("--strategy", "-s", help="Fine-tuning strategy (only 'lora' supported)"),
+        typer.Option("--strategy", "-s", help="Fine-tuning strategy: 'lora' or 'qlora'"),
     ] = "lora",
+    lora_r: Annotated[
+        int,
+        typer.Option("--lora-r", help="LoRA rank"),
+    ] = 16,
+    lora_alpha: Annotated[
+        int,
+        typer.Option("--lora-alpha", help="LoRA scaling factor (typically 2× rank)"),
+    ] = 32,
+    lora_dropout: Annotated[
+        float,
+        typer.Option("--lora-dropout", help="LoRA dropout rate"),
+    ] = 0.1,
+    learning_rate: Annotated[
+        float,
+        typer.Option("--learning-rate", help="AdamW learning rate for fine-tuning"),
+    ] = 2e-4,
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", help="Per-device training batch size"),
+    ] = 4,
+    max_length: Annotated[
+        int,
+        typer.Option("--max-length", help="Tokenisation truncation length"),
+    ] = 512,
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", help="Score drop fraction that counts as forgetting (0–1)"),
+    ] = 0.10,
 ) -> None:
     """Initialise pyrecall in the current project directory."""
     cfg_path = Path(_CONFIG_FILE)
@@ -83,6 +111,13 @@ def init(
     config = {
         "model_name": model,
         "strategy": strategy,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "learning_rate": learning_rate,
+        "batch_size": batch_size,
+        "max_length": max_length,
+        "forgetting_threshold": threshold,
         "created_at": datetime.now().isoformat(),
         "baseline_snapshot": None,
     }
@@ -110,7 +145,17 @@ def snapshot(
 
     from pyrecall.model import Model
 
-    model_obj = Model(config["model_name"], strategy=config.get("strategy", "lora"))
+    model_obj = Model(
+        config["model_name"],
+        strategy=config.get("strategy", "lora"),
+        lora_r=config.get("lora_r", 16),
+        lora_alpha=config.get("lora_alpha", 32),
+        lora_dropout=config.get("lora_dropout", 0.1),
+        learning_rate=config.get("learning_rate", 2e-4),
+        batch_size=config.get("batch_size", 4),
+        max_length=config.get("max_length", 512),
+        forgetting_threshold=config.get("forgetting_threshold", 0.10),
+    )
     model_obj.snapshot(name=name)
 
     config["baseline_snapshot"] = name
@@ -131,12 +176,17 @@ def check(
         Optional[str],
         typer.Option("--after", help="Snapshot name to compare against"),
     ] = None,
+    threshold: Annotated[
+        Optional[float],
+        typer.Option("--threshold", help="Override the forgetting threshold (0–1). Defaults to the value set in pyrecall init."),
+    ] = None,
 ) -> None:
     """
     Compare two snapshots to detect forgotten skills.
 
     When called without arguments, compares the two most recently created
     snapshots.  Pass --before and --after to compare specific snapshots.
+    Exits with code 2 when forgetting is detected.
     """
     config = _read_config()
     mgr = _build_rollback_manager(config)
@@ -164,7 +214,8 @@ def check(
 
     from pyrecall.detector import ForgettingDetector
 
-    detector = ForgettingDetector(threshold=0.10)
+    effective_threshold = threshold if threshold is not None else config.get("forgetting_threshold", 0.10)
+    detector = ForgettingDetector(threshold=effective_threshold)
     report = detector.compare(snap_before, snap_after)
     report.print()
 

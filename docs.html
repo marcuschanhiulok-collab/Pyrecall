@@ -1059,17 +1059,24 @@
 
         <!-- init -->
         <h3 id="cli-init">pyrecall init</h3>
-        <p>Initialise pyrecall in the current project directory. Creates <code>.pyrecall.json</code>.</p>
+        <p>Initialise pyrecall in the current project directory. Creates <code>.pyrecall.json</code> with all training hyperparameters stored so every subsequent command uses consistent settings.</p>
         <div class="cli-block">
           <div class="cli-line"><span class="prompt">$</span><span class="cmd">pyrecall init --model meta-llama/Llama-3.2-1B</span></div>
-          <div class="cli-line"><span class="prompt">$</span><span class="cmd">pyrecall init -m gpt2 --strategy lora</span></div>
+          <div class="cli-line"><span class="prompt">$</span><span class="cmd">pyrecall init -m gpt2 --strategy qlora --lora-r 32 --threshold 0.08</span></div>
         </div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
             <tbody>
               <tr><td>--model, -m</td><td>meta-llama/Llama-3.2-1B</td><td>HuggingFace model identifier to use for this project.</td></tr>
-              <tr><td>--strategy, -s</td><td>lora</td><td>Fine-tuning strategy.</td></tr>
+              <tr><td>--strategy, -s</td><td>lora</td><td>Fine-tuning strategy: <code>lora</code> or <code>qlora</code>.</td></tr>
+              <tr><td>--lora-r</td><td>16</td><td>LoRA rank. Higher = more expressive but more memory.</td></tr>
+              <tr><td>--lora-alpha</td><td>32</td><td>LoRA scaling factor (typically 2× rank).</td></tr>
+              <tr><td>--lora-dropout</td><td>0.1</td><td>Dropout rate applied inside LoRA layers.</td></tr>
+              <tr><td>--learning-rate</td><td>2e-4</td><td>AdamW learning rate for fine-tuning.</td></tr>
+              <tr><td>--batch-size</td><td>4</td><td>Per-device training batch size.</td></tr>
+              <tr><td>--max-length</td><td>512</td><td>Tokenisation truncation length.</td></tr>
+              <tr><td>--threshold</td><td>0.10</td><td>Score drop fraction that counts as forgetting (0–1). Used by <code>pyrecall check</code>.</td></tr>
             </tbody>
           </table>
         </div>
@@ -1099,13 +1106,15 @@
         <div class="cli-block">
           <div class="cli-line"><span class="prompt">$</span><span class="cmd">pyrecall check</span><span class="comment"> &nbsp;# compare last two snapshots</span></div>
           <div class="cli-line"><span class="prompt">$</span><span class="cmd">pyrecall check --before before_v1 --after after_finetune</span></div>
+          <div class="cli-line"><span class="prompt">$</span><span class="cmd">pyrecall check --threshold 0.05</span><span class="comment"> &nbsp;# stricter gate for this run only</span></div>
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+            <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
             <tbody>
-              <tr><td>--before</td><td>Snapshot name to use as baseline.</td></tr>
-              <tr><td>--after</td><td>Snapshot name to compare against.</td></tr>
+              <tr><td>--before</td><td><em>second-to-last</em></td><td>Snapshot name to use as baseline.</td></tr>
+              <tr><td>--after</td><td><em>most recent</em></td><td>Snapshot name to compare against.</td></tr>
+              <tr><td>--threshold</td><td><em>from config</em></td><td>Override the forgetting threshold for this check only. Falls back to the value set in <code>pyrecall init</code> (default 0.10).</td></tr>
             </tbody>
           </table>
         </div>

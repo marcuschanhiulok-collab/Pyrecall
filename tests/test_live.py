@@ -30,6 +30,12 @@ def _make_learner(
     return learner, model
 
 
+def _record_and_join(learner: LiveLearner, prompt: str, response: str) -> None:
+    """Record an interaction and wait for any triggered training to finish."""
+    learner.record(prompt, response)
+    learner._join()
+
+
 # ── SQLite logging ─────────────────────────────────────────────────────────────
 
 
@@ -123,8 +129,8 @@ class TestSQLiteLogging:
 
     def test_clear_pending_preserves_trained_rows(self, tmp_path: Path) -> None:
         learner, _ = _make_learner(tmp_path, batch_size=2)
-        learner.record("p1", "response one long enough text")
-        learner.record("p2", "response two long enough text")
+        _record_and_join(learner, "p1", "response one long enough text")
+        _record_and_join(learner, "p2", "response two long enough text")
         # Both rows are now trained after the batch trigger
         trained_count = learner.total_count() - learner.pending_count()
         assert trained_count == 2
@@ -196,31 +202,31 @@ class TestBatchTriggerLogic:
     def test_training_triggered_at_exactly_batch_size(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=3)
         for i in range(3):
-            learner.record(f"p{i}", f"response {i} long enough text here")
+            _record_and_join(learner, f"p{i}", f"response {i} long enough text here")
         model.learn.assert_called_once()
 
     def test_training_triggered_again_after_second_full_batch(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=2)
         for i in range(4):
-            learner.record(f"p{i}", f"response {i} long enough text here")
+            _record_and_join(learner, f"p{i}", f"response {i} long enough text here")
         assert model.learn.call_count == 2
 
     def test_rows_marked_trained_after_batch(self, tmp_path: Path) -> None:
         learner, _ = _make_learner(tmp_path, batch_size=2)
-        learner.record("p1", "response one long enough text")
-        learner.record("p2", "response two long enough text")
+        _record_and_join(learner, "p1", "response one long enough text")
+        _record_and_join(learner, "p2", "response two long enough text")
         assert learner.pending_count() == 0
 
     def test_total_count_preserved_after_training(self, tmp_path: Path) -> None:
         learner, _ = _make_learner(tmp_path, batch_size=2)
-        learner.record("p1", "response one long enough text")
-        learner.record("p2", "response two long enough text")
+        _record_and_join(learner, "p1", "response one long enough text")
+        _record_and_join(learner, "p2", "response two long enough text")
         assert learner.total_count() == 2
 
     def test_pending_count_after_partial_second_batch(self, tmp_path: Path) -> None:
         learner, _ = _make_learner(tmp_path, batch_size=3)
         for i in range(4):
-            learner.record(f"p{i}", f"response {i} long enough text here")
+            _record_and_join(learner, f"p{i}", f"response {i} long enough text here")
         # 3 trained, 1 pending
         assert learner.pending_count() == 1
         assert learner.total_count() == 4
@@ -228,7 +234,7 @@ class TestBatchTriggerLogic:
     def test_only_batch_size_rows_trained_per_trigger(self, tmp_path: Path) -> None:
         learner, _ = _make_learner(tmp_path, batch_size=3)
         for i in range(5):
-            learner.record(f"p{i}", f"response {i} long enough text here")
+            _record_and_join(learner, f"p{i}", f"response {i} long enough text here")
         # Only 3 rows trained, 2 still pending
         assert learner.pending_count() == 2
 
@@ -239,29 +245,29 @@ class TestBatchTriggerLogic:
 class TestFileExport:
     def test_learn_called_with_a_jsonl_path(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=2)
-        learner.record("p1", "response one long text here")
-        learner.record("p2", "response two long text here")
+        _record_and_join(learner, "p1", "response one long text here")
+        _record_and_join(learner, "p2", "response two long text here")
         model.learn.assert_called_once()
         call_path: str = model.learn.call_args[0][0]
         assert call_path.endswith(".jsonl")
 
     def test_learn_called_with_epochs_1(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=2)
-        learner.record("p1", "response one long text here")
-        learner.record("p2", "response two long text here")
+        _record_and_join(learner, "p1", "response one long text here")
+        _record_and_join(learner, "p2", "response two long text here")
         assert model.learn.call_args[1]["epochs"] == 1
 
     def test_exported_jsonl_line_count_matches_batch(self, tmp_path: Path) -> None:
         captured: list[list[str]] = []
 
-        def capture(path: str, epochs: int) -> None:
+        def capture(path: str, epochs: int) -> None:  # noqa: ARG001
             with open(path) as fh:
                 captured.append(fh.readlines())
 
         learner, model = _make_learner(tmp_path, batch_size=3)
         model.learn.side_effect = capture
         for i in range(3):
-            learner.record(f"prompt {i}", f"response {i} long enough text here")
+            _record_and_join(learner, f"prompt {i}", f"response {i} long enough text here")
 
         assert len(captured) == 1
         assert len(captured[0]) == 3
@@ -269,14 +275,14 @@ class TestFileExport:
     def test_exported_jsonl_has_text_key(self, tmp_path: Path) -> None:
         captured_lines: list[str] = []
 
-        def capture(path: str, epochs: int) -> None:
+        def capture(path: str, epochs: int) -> None:  # noqa: ARG001
             with open(path) as fh:
                 captured_lines.extend(fh.readlines())
 
         learner, model = _make_learner(tmp_path, batch_size=2)
         model.learn.side_effect = capture
-        learner.record("hello world prompt", "this is a response text")
-        learner.record("second prompt text", "another response here text")
+        _record_and_join(learner, "hello world prompt", "this is a response text")
+        _record_and_join(learner, "second prompt text", "another response here text")
 
         entry = json.loads(captured_lines[0])
         assert "text" in entry
@@ -284,14 +290,14 @@ class TestFileExport:
     def test_exported_jsonl_contains_prompt_and_response(self, tmp_path: Path) -> None:
         captured_texts: list[str] = []
 
-        def capture(path: str, epochs: int) -> None:
+        def capture(path: str, epochs: int) -> None:  # noqa: ARG001
             with open(path) as fh:
                 for line in fh:
                     captured_texts.append(json.loads(line)["text"])
 
         learner, model = _make_learner(tmp_path, batch_size=1, min_response_length=1)
         model.learn.side_effect = capture
-        learner.record("My question here", "My answer here")
+        _record_and_join(learner, "My question here", "My answer here")
 
         assert len(captured_texts) == 1
         assert "My question here" in captured_texts[0]
@@ -300,14 +306,14 @@ class TestFileExport:
     def test_exported_jsonl_uses_human_assistant_format(self, tmp_path: Path) -> None:
         captured_texts: list[str] = []
 
-        def capture(path: str, epochs: int) -> None:
+        def capture(path: str, epochs: int) -> None:  # noqa: ARG001
             with open(path) as fh:
                 for line in fh:
                     captured_texts.append(json.loads(line)["text"])
 
         learner, model = _make_learner(tmp_path, batch_size=1, min_response_length=1)
         model.learn.side_effect = capture
-        learner.record("question", "answer")
+        _record_and_join(learner, "question", "answer")
 
         assert "### Human:" in captured_texts[0]
         assert "### Assistant:" in captured_texts[0]
@@ -315,12 +321,12 @@ class TestFileExport:
     def test_temp_file_deleted_after_successful_training(self, tmp_path: Path) -> None:
         saved_paths: list[str] = []
 
-        def capture(path: str, epochs: int) -> None:
+        def capture(path: str, epochs: int) -> None:  # noqa: ARG001
             saved_paths.append(path)
 
         learner, model = _make_learner(tmp_path, batch_size=1, min_response_length=1)
         model.learn.side_effect = capture
-        learner.record("p", "a")
+        _record_and_join(learner, "p", "a")
 
         assert len(saved_paths) == 1
         assert not Path(saved_paths[0]).exists()
@@ -333,36 +339,36 @@ class TestFailedTraining:
     def test_rows_not_marked_trained_after_failure(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=2)
         model.learn.side_effect = RuntimeError("GPU out of memory")
-        learner.record("p1", "response one long text here")
-        learner.record("p2", "response two long text here")
+        _record_and_join(learner, "p1", "response one long text here")
+        _record_and_join(learner, "p2", "response two long text here")
         # Training failed — rows must still be pending
         assert learner.pending_count() == 2
 
     def test_total_count_unchanged_after_failure(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=2)
         model.learn.side_effect = RuntimeError("OOM")
-        learner.record("p1", "response one long text here")
-        learner.record("p2", "response two long text here")
+        _record_and_join(learner, "p1", "response one long text here")
+        _record_and_join(learner, "p2", "response two long text here")
         assert learner.total_count() == 2
 
     def test_db_still_queryable_after_failure(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=2)
         model.learn.side_effect = RuntimeError("OOM")
-        learner.record("p1", "response one long text here")
-        learner.record("p2", "response two long text here")
+        _record_and_join(learner, "p1", "response one long text here")
+        _record_and_join(learner, "p2", "response two long text here")
         # Should not raise
         assert learner.pending_count() >= 0
 
     def test_temp_file_deleted_even_after_failure(self, tmp_path: Path) -> None:
         saved_paths: list[str] = []
 
-        def fail_and_record(path: str, epochs: int) -> None:
+        def fail_and_record(path: str, epochs: int) -> None:  # noqa: ARG001
             saved_paths.append(path)
             raise RuntimeError("training failed")
 
         learner, model = _make_learner(tmp_path, batch_size=1, min_response_length=1)
         model.learn.side_effect = fail_and_record
-        learner.record("p", "a")
+        _record_and_join(learner, "p", "a")
 
         assert len(saved_paths) == 1
         assert not Path(saved_paths[0]).exists()
@@ -372,10 +378,10 @@ class TestFailedTraining:
         # First training fails, second succeeds.
         model.learn.side_effect = [RuntimeError("fail"), None]
         # Two records → first training fires and fails; pending rows stay at 2.
-        learner.record("p0", "response 0 long text here extra")
-        learner.record("p1", "response 1 long text here extra")
-        # Third record → pending becomes 3 (>= batch_size=2) → second training fires and succeeds.
-        learner.record("p2", "response 2 long text here extra")
+        _record_and_join(learner, "p0", "response 0 long text here extra")
+        _record_and_join(learner, "p1", "response 1 long text here extra")
+        # Lock is now released; third record → pending becomes 3 → second training fires.
+        _record_and_join(learner, "p2", "response 2 long text here extra")
         assert model.learn.call_count == 2
         # Two rows were marked trained on the second run.
         assert learner.total_count() - learner.pending_count() == 2
@@ -394,8 +400,8 @@ class TestEdgeCases:
     def test_pending_count_only_counts_untrained(self, tmp_path: Path) -> None:
         learner, _ = _make_learner(tmp_path, batch_size=2)
         # Fill one batch (marks 2 as trained)
-        learner.record("p1", "response one long text here")
-        learner.record("p2", "response two long text here")
+        _record_and_join(learner, "p1", "response one long text here")
+        _record_and_join(learner, "p2", "response two long text here")
         # Add one more pending row
         learner.record("p3", "response three long text here")
         assert learner.pending_count() == 1
@@ -411,6 +417,11 @@ class TestEdgeCases:
     def test_batch_size_one_triggers_every_record(self, tmp_path: Path) -> None:
         learner, model = _make_learner(tmp_path, batch_size=1, min_response_length=1)
         for i in range(3):
-            learner.record(f"p{i}", "a")
+            _record_and_join(learner, f"p{i}", "a")
         assert model.learn.call_count == 3
         assert learner.pending_count() == 0
+
+    def test_join_on_no_thread_is_safe(self, tmp_path: Path) -> None:
+        learner, _ = _make_learner(tmp_path, batch_size=100)
+        # _join() before any training has been triggered must not raise
+        learner._join()

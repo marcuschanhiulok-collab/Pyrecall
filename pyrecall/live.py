@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
@@ -53,6 +54,8 @@ class LiveLearner:
         self.batch_size = batch_size
         self.db_path: Path = db_path or Path.home() / ".pyrecall" / "live_data.db"
         self.min_response_length = min_response_length
+        self._training_lock = threading.Lock()
+        self._training_thread: Optional[threading.Thread] = None
         self._init_db()
 
     # ── public API ─────────────────────────────────────────────────────────────
@@ -107,9 +110,24 @@ class LiveLearner:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _join(self) -> None:
+        """Wait for any in-progress background training thread to finish."""
+        if self._training_thread is not None:
+            self._training_thread.join()
+
     def _maybe_trigger_training(self) -> None:
         if self.pending_count() >= self.batch_size:
+            if self._training_lock.acquire(blocking=False):
+                self._training_thread = threading.Thread(
+                    target=self._trigger_training_locked, daemon=True
+                )
+                self._training_thread.start()
+
+    def _trigger_training_locked(self) -> None:
+        try:
             self._trigger_training()
+        finally:
+            self._training_lock.release()
 
     def _trigger_training(self) -> None:
         """Export the current pending batch to JSONL and call model.learn()."""
