@@ -84,10 +84,7 @@ When you call `model.snapshot("name")`, pyrecall:
 2. Embeds each response using the model's own hidden states
 3. Scores each response against a reference answer via cosine similarity
 4. Saves scores + LoRA adapter weights to `~/.pyrecall/snapshots/`
-5. Optionally encrypts snapshot metadata when `privacy=True`.
-
-To use privacy mode, generate a key with `cryptography.fernet.Fernet.generate_key()`
-and set `ENCRYPT_KEY` in your `.env` file.
+5. Optionally encrypts snapshot metadata when `privacy=True` (requires `pip install pyrecall[privacy]`).
 
 All local. No API calls. Works offline.
 
@@ -104,7 +101,7 @@ All local. No API calls. Works offline.
 
 ### 2. Forgetting detection
 
-`model.check()` re-runs the same 48 benchmarks on the current model and diffs the scores:
+`model.check()` re-runs the same 64 benchmarks on the current model and diffs the scores:
 
 ```text
 ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
