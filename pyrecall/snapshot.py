@@ -42,7 +42,6 @@ class SkillSnapshot:
     Stores benchmark responses + scores and optionally a path to the saved
     LoRA adapter so the model can be rolled back to this exact state.
     """
-    encrypted: bool
     name: str
     model_name: str
     created_at: datetime = field(default_factory=datetime.now)
