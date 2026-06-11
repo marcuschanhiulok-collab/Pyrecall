@@ -298,6 +298,83 @@ class TestLearn:
 
         mock_model.snapshot.assert_not_called()
 
+    def test_snapshot_before_triggers_snapshot_before_learn(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("pre_train")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["learn", str(data), "--snapshot-before", "pre_train"])
+
+        # snapshot must be called before learn
+        calls = mock_model.method_calls
+        snapshot_idx = next(i for i, c in enumerate(calls) if c[0] == "snapshot")
+        learn_idx = next(i for i, c in enumerate(calls) if c[0] == "learn")
+        assert snapshot_idx < learn_idx
+
+    def test_snapshot_before_sets_baseline_in_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("pre_train")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["learn", str(data), "--snapshot-before", "pre_train"])
+
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "pre_train"
+
+    def test_snapshot_before_and_after_both_called(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("snap")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, [
+                "learn", str(data),
+                "--snapshot-before", "pre_train",
+                "--snapshot-after", "post_train",
+            ])
+
+        assert mock_model.snapshot.call_count == 2
+        names_called = [c.kwargs.get("name") for c in mock_model.snapshot.call_args_list]
+        assert "pre_train" in names_called
+        assert "post_train" in names_called
+
+    def test_snapshot_before_and_after_baseline_is_after(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("snap")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, [
+                "learn", str(data),
+                "--snapshot-before", "pre_train",
+                "--snapshot-after", "post_train",
+            ])
+
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "post_train"
+
     def test_pyrecall_error_exits_with_code_one(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

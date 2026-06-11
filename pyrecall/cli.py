@@ -233,6 +233,10 @@ def learn(
         bool,
         typer.Option("--resume", help="Resume from the latest checkpoint if a previous run was interrupted"),
     ] = False,
+    snapshot_before: Annotated[
+        Optional[str],
+        typer.Option("--snapshot-before", help="Take a named snapshot before training begins"),
+    ] = None,
     snapshot_after: Annotated[
         Optional[str],
         typer.Option("--snapshot-after", help="Take a named snapshot immediately after training completes"),
@@ -242,12 +246,13 @@ def learn(
     Fine-tune the model on a local dataset.
 
     Reads hyperparameters from .pyrecall.json unless overridden by flags.
-    Pass --snapshot-after <name> to automatically snapshot the model once
-    training finishes, so you can run pyrecall check straight away.
+    Use --snapshot-before and --snapshot-after to bracket training with
+    snapshots so you can immediately run pyrecall check:
 
-    Example::
-
-        pyrecall learn train.jsonl --epochs 5 --snapshot-after after_v2
+        pyrecall learn train.jsonl \\
+            --snapshot-before before_v1 \\
+            --snapshot-after after_v1
+        pyrecall check
     """
     if not Path(data).exists():
         console.print(f"[red]Error:[/red] Training data file not found: '{data}'")
@@ -270,6 +275,12 @@ def learn(
         replay_buffer_size=config.get("replay_buffer_size", 500),
         replay_mix_ratio=config.get("replay_mix_ratio", 0.3),
     )
+
+    if snapshot_before:
+        model_obj.snapshot(name=snapshot_before)
+        config["baseline_snapshot"] = snapshot_before
+        _write_config(config)
+        console.print(f"[dim]  Baseline set to '{snapshot_before}' in {_CONFIG_FILE}.[/dim]")
 
     try:
         model_obj.learn(
