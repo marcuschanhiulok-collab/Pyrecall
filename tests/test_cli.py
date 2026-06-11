@@ -406,6 +406,68 @@ class TestLearn:
 
         assert result.exit_code == 0
 
+    def test_no_update_baseline_with_snapshot_after_keeps_baseline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path, baseline="stable")
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("after_v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(app, [
+                "learn", str(data),
+                "--snapshot-after", "after_v1",
+                "--no-update-baseline",
+            ])
+
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "stable"
+
+    def test_no_update_baseline_with_snapshot_before_keeps_baseline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path, baseline="stable")
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("before_v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(app, [
+                "learn", str(data),
+                "--snapshot-before", "before_v1",
+                "--no-update-baseline",
+            ])
+
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "stable"
+
+    def test_no_update_baseline_still_calls_learn_and_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path, baseline="stable")
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("after_v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, [
+                "learn", str(data),
+                "--snapshot-after", "after_v1",
+                "--no-update-baseline",
+            ])
+
+        mock_model.learn.assert_called_once()
+        mock_model.snapshot.assert_called_once_with(name="after_v1")
+
 
 # ── snapshot ──────────────────────────────────────────────────────────────────
 
@@ -476,6 +538,48 @@ class TestSnapshot:
             runner.invoke(app, ["snapshot", "v1"])
 
         assert mock_cls.call_args[1]["strategy"] == "lora"
+
+    def test_no_update_baseline_flag_keeps_existing_baseline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, baseline="stable_baseline")
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("new_snap")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(app, ["snapshot", "new_snap", "--no-update-baseline"])
+
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "stable_baseline"
+
+    def test_no_update_baseline_still_calls_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, baseline="stable_baseline")
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("new_snap")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["snapshot", "new_snap", "--no-update-baseline"])
+
+        mock_model.snapshot.assert_called_once_with(name="new_snap")
+
+    def test_default_updates_baseline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, baseline="old")
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("new_snap")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["snapshot", "new_snap"])
+
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "new_snap"
 
 
 # ── check ─────────────────────────────────────────────────────────────────────

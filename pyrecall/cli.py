@@ -253,6 +253,10 @@ def learn(
         Optional[str],
         typer.Option("--snapshot-after", help="Take a named snapshot immediately after training completes"),
     ] = None,
+    no_update_baseline: Annotated[
+        bool,
+        typer.Option("--no-update-baseline", help="Do not update baseline_snapshot in .pyrecall.json after snapshotting"),
+    ] = False,
 ) -> None:
     """
     Fine-tune the model on a local dataset.
@@ -265,6 +269,10 @@ def learn(
             --snapshot-before before_v1 \\
             --snapshot-after after_v1
         pyrecall check
+
+    Pass --no-update-baseline to keep your existing baseline unchanged even
+    when --snapshot-before or --snapshot-after are used.  This is useful in
+    CI where you want a stable reference point regardless of training outcome.
     """
     if not Path(data).exists():
         console.print(f"[red]Error:[/red] Training data file not found: '{data}'")
@@ -290,9 +298,12 @@ def learn(
 
     if snapshot_before:
         model_obj.snapshot(name=snapshot_before)
-        config["baseline_snapshot"] = snapshot_before
-        _write_config(config)
-        console.print(f"[dim]  Baseline set to '{snapshot_before}' in {_CONFIG_FILE}.[/dim]")
+        if not no_update_baseline:
+            config["baseline_snapshot"] = snapshot_before
+            _write_config(config)
+            console.print(f"[dim]  Baseline set to '{snapshot_before}' in {_CONFIG_FILE}.[/dim]")
+        else:
+            console.print(f"[dim]  Snapshot '{snapshot_before}' taken (baseline unchanged).[/dim]")
 
     try:
         model_obj.learn(
@@ -309,20 +320,31 @@ def learn(
 
     if snapshot_after:
         model_obj.snapshot(name=snapshot_after)
-        config["baseline_snapshot"] = snapshot_after
-        _write_config(config)
-        console.print(f"[dim]  Baseline updated to '{snapshot_after}' in {_CONFIG_FILE}.[/dim]")
+        if not no_update_baseline:
+            config["baseline_snapshot"] = snapshot_after
+            _write_config(config)
+            console.print(f"[dim]  Baseline updated to '{snapshot_after}' in {_CONFIG_FILE}.[/dim]")
+        else:
+            console.print(f"[dim]  Snapshot '{snapshot_after}' taken (baseline unchanged).[/dim]")
 
 
 @app.command()
 def snapshot(
     name: Annotated[str, typer.Argument(help="Name for this snapshot, e.g. 'before_v2'")],
+    no_update_baseline: Annotated[
+        bool,
+        typer.Option("--no-update-baseline", help="Do not update baseline_snapshot in .pyrecall.json"),
+    ] = False,
 ) -> None:
     """
     Load the model, run all benchmarks, and save a named capability snapshot.
 
     This is a slow operation — it runs 20 benchmark prompts through the model
     and saves the LoRA adapter weights to disk.  Plan for several minutes on CPU.
+
+    Pass --no-update-baseline to take the snapshot without overwriting the
+    current baseline in .pyrecall.json.  Useful when you want to capture a
+    point-in-time reading without disturbing your stable reference point.
     """
     config = _read_config()
 
@@ -343,12 +365,12 @@ def snapshot(
     )
     model_obj.snapshot(name=name)
 
-    config["baseline_snapshot"] = name
-    _write_config(config)
-
-    console.print(
-        f"[dim]  Baseline updated to '{name}' in {_CONFIG_FILE}.[/dim]"
-    )
+    if not no_update_baseline:
+        config["baseline_snapshot"] = name
+        _write_config(config)
+        console.print(f"[dim]  Baseline updated to '{name}' in {_CONFIG_FILE}.[/dim]")
+    else:
+        console.print(f"[dim]  Snapshot '{name}' taken (baseline unchanged).[/dim]")
 
 
 @app.command()

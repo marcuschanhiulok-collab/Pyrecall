@@ -208,6 +208,7 @@ pyrecall replay clear --yes   # skip the prompt
 | `--resume` | `false` | Resume from the latest checkpoint if a previous run was interrupted |
 | `--snapshot-before` | — | Take a named snapshot immediately **before** training begins (sets it as the baseline) |
 | `--snapshot-after` | — | Take a named snapshot immediately **after** training completes (sets it as the new baseline) |
+| `--no-update-baseline` | `false` | Take snapshots without overwriting `baseline_snapshot` in `.pyrecall.json` — keeps your stable CI reference point intact |
 
 ### A full training workflow
 
@@ -220,6 +221,17 @@ pyrecall learn customer_service.jsonl --epochs 3 \
     --snapshot-after after_v1
 pyrecall check --before before_v1 --after after_v1
 # exit code 0 → ship it   exit code 2 → pyrecall rollback before_v1
+```
+
+In CI you often want a fixed reference point that never moves until you explicitly promote it.
+Use `--no-update-baseline` to take diagnostic snapshots without touching your stable baseline:
+
+```bash
+# baseline stays at "golden" no matter what this run produces
+pyrecall learn nightly_data.jsonl --epochs 1 \
+    --snapshot-after nightly_$(date +%Y%m%d) \
+    --no-update-baseline
+pyrecall check --before golden --after nightly_$(date +%Y%m%d)
 ```
 
 ---
