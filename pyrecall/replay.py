@@ -120,9 +120,7 @@ class ReplayBuffer:
             # Trim to current max_size in case the config changed.
             if len(self._buffer) > self._max_size:
                 self._buffer = self._buffer[: self._max_size]
-            self._seen_hashes = {
-                hashlib.sha256(t.encode()).hexdigest() for t in self._buffer
-            }
+            self._seen_hashes = {hashlib.sha256(t.encode()).hexdigest() for t in self._buffer}
         except Exception as exc:
             logger.warning("Could not load replay buffer from %s: %s", self._path, exc)
             self._buffer = []
