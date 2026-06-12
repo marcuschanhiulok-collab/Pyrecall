@@ -272,6 +272,7 @@ class Model:
                     logger.warning("Tracker %s failed to log snapshot: %s", type(t).__name__, exc)
 
         return snap
+
     def learn(
         self,
         data_path: str,
@@ -477,14 +478,11 @@ class Model:
         after = SkillSnapshot(name=after_name, model_name=self.model_name, scores=after_scores)
         after.save(self.rollback_manager.base_dir / after_name)
 
-
         if self._baseline_snapshot_name is None:
             raise PyrecallError(
                 "No baseline snapshot found.\n"
                 "Call model.snapshot(name='before_v1') before fine-tuning."
             )
-
-
 
         report = self.detector.compare(before, after)
         report.print()
@@ -524,6 +522,7 @@ class Model:
         report = self.detector.compare(before, after)
         report.print()
         return report
+
     def rollback(self, to: str) -> None:
         """
         Restore the model to the state captured in snapshot *to*.
@@ -542,9 +541,7 @@ class Model:
         snap = self.rollback_manager.load_snapshot(to)
 
         if not snap or snap.adapter_path is None:
-            raise PyrecallError(
-                f"Snapshot '{to}' is invalid or missing adapter metadata."
-            )
+            raise PyrecallError(f"Snapshot '{to}' is invalid or missing adapter metadata.")
 
         if not snap.adapter_path.exists():
             raise PyrecallError(
@@ -723,6 +720,7 @@ class Model:
             (self.base_dir / ".current_baseline").write_text(name)
         except Exception:
             pass
+
     def _run_benchmarks(self) -> list[SkillScore]:
         """Run default + custom benchmarks and return SkillScore objects."""
         all_benchmarks = DEFAULT_BENCHMARKS + self.custom_benchmarks.load_all()
