@@ -55,6 +55,11 @@ class RollbackManager:
         Sets ``snapshot.adapter_path`` before writing so the JSON includes the
         adapter location. Returns the snapshot directory path.
 
+        The adapter is written to a staging directory first. If compression is
+        requested, it is applied there before an atomic rename to the final
+        ``adapter/`` path, so a crash mid-compression never leaves the snapshot
+        in an unloadable half-compressed state.
+
         Args:
             compression: ``"none"`` (default), ``"gzip"``, ``"zstd"``, or ``"lz4"``.
                          ``"zstd"`` requires ``pip install zstandard``.
@@ -66,12 +71,23 @@ class RollbackManager:
         snap_dir.mkdir(parents=True, exist_ok=True)
 
         adapter_dir = snap_dir / "adapter"
-        peft_model.save_pretrained(str(adapter_dir))
-        logger.debug("Adapter saved to %s", adapter_dir)
+        adapter_staging = snap_dir / "adapter.staging"
+
+        if adapter_staging.exists():
+            shutil.rmtree(adapter_staging)
+        adapter_staging.mkdir(parents=True, exist_ok=True)
+
+        peft_model.save_pretrained(str(adapter_staging))
+        logger.debug("Adapter staged to %s", adapter_staging)
 
         if compression != "none":
-            compress_adapter_dir(adapter_dir, compression)
-            logger.debug("Adapter compressed with %s", compression)
+            compress_adapter_dir(adapter_staging, compression)
+            logger.debug("Adapter compressed with %s in staging", compression)
+
+        if adapter_dir.exists():
+            shutil.rmtree(adapter_dir)
+        adapter_staging.rename(adapter_dir)
+        logger.debug("Adapter promoted to %s", adapter_dir)
 
         snapshot.adapter_path = adapter_dir
         snapshot.adapter_compression = compression
