@@ -584,10 +584,24 @@ def snapshot(
     ] = "none",
     dry_run: Annotated[
         bool,
+        typer.Option("--dry-run", help="Score without saving adapter weights (no disk usage)."),
+    ] = False,
+    push_to: Annotated[
+        str | None,
         typer.Option(
-            "--dry-run",
-            help="Score without saving adapter weights or updating the baseline.",
+            "--push",
+            help="After saving, push the snapshot to this Hub repo (e.g. 'my-org/my-model-snapshots')",
         ),
+    ] = None,
+    no_weights: Annotated[
+        bool,
+        typer.Option(
+            "--no-weights", help="When --push is set, upload scores only (no adapter weights)"
+        ),
+    ] = False,
+    push_private: Annotated[
+        bool,
+        typer.Option("--private", help="When --push is set, create the Hub repo as private"),
     ] = False,
 ) -> None:
     """
@@ -605,6 +619,7 @@ def snapshot(
 
     Use --compression gzip to reduce adapter storage by 40-60% (no extra deps).
     Use --compression zstd for faster compression with similar ratios (pip install zstandard).
+    Use --push to immediately upload the snapshot to Hugging Face Hub after saving.
     """
     from pyrecall.compress import SUPPORTED_CODECS
 
@@ -638,9 +653,24 @@ def snapshot(
     tracker = _build_trackers(log_wandb, log_mlflow, log_neptune, neptune_project)
     model_obj.snapshot(name=name, tracker=tracker, dry_run=dry_run)
 
-    if dry_run:
-        console.print("[dim]  Dry run — no data saved, baseline unchanged.[/dim]")
-    elif not no_update_baseline:
+    if push_to and not dry_run:
+        from pyrecall.hub import push_snapshot
+        from pyrecall.rollback import RollbackManager
+
+        mgr = RollbackManager(model_name=config["model_name"])
+        snap = mgr.load_snapshot(name)
+        snap_dir = mgr.base_dir / name
+        try:
+            url = push_snapshot(
+                snap_dir, snap, push_to, include_weights=not no_weights, private=push_private
+            )
+            console.print(f"[success]✓ Pushed to {push_to}[/success]")
+            console.print(f"[dim]  {url}[/dim]")
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] Could not push to Hub: {exc}")
+            raise typer.Exit(1)
+
+    if not no_update_baseline:
         config["baseline_snapshot"] = name
         _write_config(config)
         console.print(f"[dim]  Baseline updated to '{name}' in {_CONFIG_FILE}.[/dim]")
@@ -1433,6 +1463,7 @@ def status(
                     "scores": snap.category_scores(),
                     "adapter_ok": bool(snap.adapter_path and snap.adapter_path.exists()),
                     "is_baseline": snap.name == baseline,
+                    "hub_repo": snap.hub_repo,
                 }
                 for snap in all_snaps
             ],
@@ -1461,7 +1492,11 @@ def status(
     for snap in all_snaps:
         cat_scores = snap.category_scores()
         is_baseline = snap.name == baseline
-        name_markup = f"[bold green]{snap.name} ★[/bold green]" if is_baseline else snap.name
+        hub_tag = " [dim cyan][hub][/dim cyan]" if snap.hub_repo else ""
+        if is_baseline:
+            name_markup = f"[bold green]{snap.name} ★[/bold green]{hub_tag}"
+        else:
+            name_markup = f"{snap.name}{hub_tag}"
         adapter_ok = "✓" if (snap.adapter_path and snap.adapter_path.exists()) else "✗"
 
         overall = snap.overall_score()
@@ -2293,3 +2328,112 @@ def live_clear(
 
     label = "all interactions" if all_ else f"{count} pending interactions"
     console.print(f"[green]✓ Cleared {label}[/green] from live-learning database.")
+
+
+# ── hub commands ───────────────────────────────────────────────────────────────
+
+
+@app.command()
+def push(
+    name: Annotated[str, typer.Argument(help="Name of the local snapshot to push")],
+    repo_id: Annotated[
+        str,
+        typer.Option(
+            "--to",
+            help="Hub repo in 'owner/repo-name' format, e.g. 'my-org/my-model-snapshots'",
+        ),
+    ],
+    no_weights: Annotated[
+        bool,
+        typer.Option("--no-weights", help="Upload scores only — skip adapter weights"),
+    ] = False,
+    private: Annotated[
+        bool,
+        typer.Option("--private", help="Create the Hub repo as private if it doesn't exist"),
+    ] = False,
+) -> None:
+    """Push a local snapshot to a Hugging Face Hub dataset repo.
+
+    Requires huggingface_hub (pip install huggingface_hub) and a valid HF
+    token (huggingface-cli login).
+
+    Example:
+
+        pyrecall push before_v1 --to my-org/my-model-snapshots
+    """
+    config = _read_config()
+    mgr = _build_rollback_manager(config)
+
+    if not mgr.has_snapshot(name):
+        console.print(f"[red]Error:[/red] Snapshot '{name}' not found locally.")
+        raise typer.Exit(1)
+
+    from pyrecall.hub import push_snapshot
+
+    snap = mgr.load_snapshot(name)
+    snap_dir = mgr.base_dir / name
+    try:
+        url = push_snapshot(
+            snap_dir,
+            snap,
+            repo_id,
+            include_weights=not no_weights,
+            private=private,
+        )
+        console.print(f"[success]✓ Snapshot '{name}' pushed to {repo_id}[/success]")
+        console.print(f"[dim]  {url}[/dim]")
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def pull(
+    name: Annotated[str, typer.Argument(help="Snapshot name to pull from the Hub")],
+    repo_id: Annotated[
+        str,
+        typer.Option(
+            "--from-repo",
+            help="Hub repo in 'owner/repo-name' format",
+        ),
+    ],
+    no_weights: Annotated[
+        bool,
+        typer.Option("--no-weights", help="Download scores only — skip adapter weights"),
+    ] = False,
+) -> None:
+    """Pull a snapshot from a Hugging Face Hub dataset repo.
+
+    Registers the snapshot locally so it appears in pyrecall status and can
+    be used for rollback.
+
+    Requires huggingface_hub (pip install huggingface_hub).
+
+    Example:
+
+        pyrecall pull before_v1 --from-repo my-org/my-model-snapshots
+    """
+    config = _read_config()
+    mgr = _build_rollback_manager(config)
+
+    from pyrecall.hub import pull_snapshot
+
+    console.print(f"[info]Pulling snapshot '{name}' from '{repo_id}'…[/info]")
+    try:
+        snap = pull_snapshot(
+            name,
+            config["model_name"],
+            repo_id,
+            mgr.base_dir,
+            include_weights=not no_weights,
+        )
+        console.print(
+            f"[success]✓ Snapshot '{name}' pulled from {repo_id}. "
+            f"Overall score: {snap.overall_score():.3f}[/success]"
+        )
+    except ImportError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
