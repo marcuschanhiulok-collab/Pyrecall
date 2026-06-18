@@ -7,11 +7,13 @@ import json
 import math
 import sys
 import time
+import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -168,11 +170,51 @@ def _build_trackers(
     return trackers if trackers else None
 
 
+def _load_init_config(path: str) -> dict:
+    """
+    Load YAML or TOML config file for 'pyrecall init'
+    """
+
+    config_path = Path(path)
+
+    if not config_path.exists():
+        raise typer.BadParameter(f"Config file not found: {path}")
+
+    suffix = config_path.suffix.lower()
+
+    try:
+        if suffix in {".yaml", ".yml"}:
+            with open(config_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+
+        elif suffix == ".toml":
+            with open(config_path, "rb") as f:
+                data = tomllib.load(f)
+
+        else:
+            raise typer.BadParameter("Config file must be .yaml, .yml, or .toml")
+
+    except Exception as exc:
+        raise typer.BadParameter(f"Failed to parse config file: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise typer.BadParameter("Config file must contain a mapping/object at the top level.")
+
+    return data
+
+
 # ── commands ───────────────────────────────────────────────────────────────────
 
 
 @app.command()
 def init(
+    from_config: Annotated[
+        str | None,
+        typer.Option(
+            "--from-config",
+            help="Load init settings from a YAML or TOML configuration file.",
+        ),
+    ] = None,
     model: Annotated[
         str,
         typer.Option("--model", "-m", help="HuggingFace model identifier"),
@@ -303,6 +345,20 @@ def init(
         "baseline_snapshot": None,
     }
     _write_config(config)
+
+    config_values = {}
+
+    if from_config:
+        config_values = _load_init_config(from_config)
+
+    model = model or config_values.get("model")
+    strategy = strategy or config_values.get("strategy")
+
+    if lora_r is None:
+        lora_r = config_values.get("lora_r")
+
+    if lora_alpha is None:
+        lora_alpha = config_values.get("lora_alpha")
 
     console.print(f"[green]✓ Initialised pyrecall[/green] with [bold]{model}[/bold] ({strategy})")
     console.print(f"[dim]  Config saved to {_CONFIG_FILE}[/dim]")
