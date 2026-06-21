@@ -151,12 +151,18 @@ def _parse_category_thresholds(raw: list[str]) -> dict[str, float]:
             )
         cat, _, val = item.partition("=")
         try:
-            result[cat.strip()] = float(val.strip())
+            v = float(val.strip())
         except ValueError:
             raise typer.BadParameter(
                 f"Threshold value must be a number, got '{val}'",
                 param_hint="--category-threshold",
             )
+        if not 0.0 < v <= 1.0:
+            raise typer.BadParameter(
+                f"Threshold value must be between 0 and 1, got '{v}'",
+                param_hint="--category-threshold",
+            )
+        result[cat.strip()] = v
     return result
 
 
@@ -373,6 +379,23 @@ def init(
     }
 
     config.update({k: v for k, v in config_values.items() if v is not None})
+
+    # Re-validate after config-file override so bad values can't bypass CLI checks.
+    config_errors: list[str] = []
+    _ft = config.get("forgetting_threshold")
+    _final_threshold: float = float(_ft) if isinstance(_ft, (int, float)) else threshold
+    if not 0.0 < _final_threshold <= 1.0:
+        config_errors.append(f"forgetting_threshold must be > 0 and <= 1, got {_final_threshold}")
+    if config.get("strategy") not in ("lora", "qlora"):
+        config_errors.append(f"strategy must be 'lora' or 'qlora', got '{config.get('strategy')}'")
+    if config.get("scoring_method") not in ("log_likelihood", "cosine"):
+        config_errors.append(
+            f"scoring_method must be 'log_likelihood' or 'cosine', got '{config.get('scoring_method')}'"
+        )
+    if config_errors:
+        for msg in config_errors:
+            console.print(f"[red]Error (from config file):[/red] {msg}")
+        raise typer.Exit(1)
 
     _write_config(config)
 
@@ -732,7 +755,9 @@ def snapshot(
             console.print(f"[red]Error:[/red] Could not push to Hub: {exc}")
             raise typer.Exit(1)
 
-    if not no_update_baseline:
+    if dry_run:
+        pass  # dry-run never persists weights, so there is nothing to set as baseline
+    elif not no_update_baseline:
         config["baseline_snapshot"] = name
         _write_config(config)
         console.print(f"[dim]  Baseline updated to '{name}' in {_CONFIG_FILE}.[/dim]")
@@ -889,19 +914,19 @@ def check(
                 return 1
             try:
                 snap_before = mgr.load_snapshot(before)
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError) as exc:
                 if ci:
-                    typer.echo(f"Error: Snapshot '{before}' not found.")
+                    typer.echo(f"Error: {exc}")
                 else:
-                    console.print(f"[red]Error:[/red] Snapshot '{before}' not found.")
+                    console.print(f"[red]Error:[/red] {exc}")
                 return 1
             try:
                 snap_after = mgr.load_snapshot(after)
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError) as exc:
                 if ci:
-                    typer.echo(f"Error: Snapshot '{after}' not found.")
+                    typer.echo(f"Error: {exc}")
                 else:
-                    console.print(f"[red]Error:[/red] Snapshot '{after}' not found.")
+                    console.print(f"[red]Error:[/red] {exc}")
                 return 1
 
         report = detector.compare(snap_before, snap_after)
@@ -983,26 +1008,22 @@ def check(
                     if before is not None:
                         try:
                             snap_b = mgr.load_snapshot(before)
-                        except FileNotFoundError:
+                        except (FileNotFoundError, ValueError) as exc:
                             if ci:
-                                typer.echo(f"Snapshot '{before}' not found.")
+                                typer.echo(f"Error: {exc}")
                             else:
-                                console.print(
-                                    f"[dim][{ts}][/dim] [red]Snapshot '{before}' not found.[/red]"
-                                )
+                                console.print(f"[dim][{ts}][/dim] [red]Error: {exc}[/red]")
                             last_exit_code = 1
                             _failed = True
 
                     if after is not None:
                         try:
                             snap_a = mgr.load_snapshot(after)
-                        except FileNotFoundError:
+                        except (FileNotFoundError, ValueError) as exc:
                             if ci:
-                                typer.echo(f"Snapshot '{after}' not found.")
+                                typer.echo(f"Error: {exc}")
                             else:
-                                console.print(
-                                    f"[dim][{ts}][/dim] [red]Snapshot '{after}' not found.[/red]"
-                                )
+                                console.print(f"[dim][{ts}][/dim] [red]Error: {exc}[/red]")
                             last_exit_code = 1
                             _failed = True
 
@@ -1100,13 +1121,13 @@ def diff(
 
     try:
         snap_before = mgr.load_snapshot(snap1)
-    except FileNotFoundError:
-        console.print(f"[red]Error:[/red] Snapshot '{snap1}' not found.")
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
     try:
         snap_after = mgr.load_snapshot(snap2)
-    except FileNotFoundError:
-        console.print(f"[red]Error:[/red] Snapshot '{snap2}' not found.")
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
 
     from pyrecall.detector import ForgettingDetector
@@ -1180,8 +1201,8 @@ def compare(
     for name in snapshots:
         try:
             loaded.append(mgr.load_snapshot(name))
-        except FileNotFoundError:
-            console.print(f"[red]Error:[/red] Snapshot '{name}' not found.")
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]Error:[/red] {exc}")
             raise typer.Exit(1)
 
     # Collect all category names in a stable order.
@@ -1191,13 +1212,16 @@ def compare(
             if cat not in all_cats:
                 all_cats.append(cat)
 
+    def _safe_round4(v: float) -> float | None:
+        return None if math.isnan(v) else round(v, 4)
+
     if json_output:
         out: dict = {
             "snapshots": [s.name for s in loaded],
             "categories": {
-                "overall": {s.name: round(s.overall_score(), 4) for s in loaded},
+                "overall": {s.name: _safe_round4(s.overall_score()) for s in loaded},
                 **{
-                    cat: {s.name: round(s.category_scores().get(cat, 0.0), 4) for s in loaded}
+                    cat: {s.name: _safe_round4(s.category_scores().get(cat, 0.0)) for s in loaded}
                     for cat in all_cats
                 },
             },
@@ -1214,14 +1238,18 @@ def compare(
         table.add_column(snap.name, justify="right")
 
     def _fmt_row(label: str, values: list[float]) -> None:
-        best = max(values)
-        worst = min(values)
+        finite = [v for v in values if not math.isnan(v)]
+        best = max(finite) if finite else None
+        worst = min(finite) if finite else None
         cells: list[str] = [label]
         for v in values:
+            if math.isnan(v):
+                cells.append("-")
+                continue
             s = f"{v:.3f}"
-            if v == best and best != worst:
+            if best != worst and v == best:
                 cells.append(f"[green]{s}[/green]")
-            elif v == worst and best != worst:
+            elif best != worst and v == worst:
                 cells.append(f"[red]{s}[/red]")
             else:
                 cells.append(s)
@@ -1514,6 +1542,10 @@ def status(
     baseline = config.get("baseline_snapshot")
 
     if json_output:
+
+        def _nan_safe(v: float) -> float | None:
+            return None if math.isnan(v) else v
+
         out = {
             "model_name": config.get("model_name"),
             "baseline_snapshot": baseline,
@@ -1521,8 +1553,8 @@ def status(
                 {
                     "name": snap.name,
                     "created_at": snap.created_at.isoformat(),
-                    "overall": snap.overall_score(),
-                    "scores": snap.category_scores(),
+                    "overall": _nan_safe(snap.overall_score()),
+                    "scores": {k: _nan_safe(v) for k, v in snap.category_scores().items()},
                     "adapter_ok": bool(snap.adapter_path and snap.adapter_path.exists()),
                     "is_baseline": snap.name == baseline,
                     "hub_repo": snap.hub_repo,
@@ -1657,6 +1689,10 @@ def history(
             category_thresholds=config.get("category_thresholds", {}),
         )
 
+        def _safe_overall(snap) -> float | None:
+            v = snap.overall_score()
+            return None if math.isnan(v) else round(v, 4)
+
         health_rows: list[dict] = []
         for i, snap in enumerate(snaps):
             is_baseline = snap.name == baseline
@@ -1665,7 +1701,7 @@ def history(
                     {
                         "name": snap.name,
                         "created_at": snap.created_at.isoformat(),
-                        "overall": round(snap.overall_score(), 4),
+                        "overall": _safe_overall(snap),
                         "status": "first",
                         "degraded_skills": [],
                         "notes": "(baseline)" if is_baseline else "(first snapshot)",
@@ -1677,6 +1713,8 @@ def history(
                 _comp_map = {x.category: x for x in report.comparisons}
                 dropped_notes = [
                     f"{c} {_comp_map[c].delta:+.3f}"
+                    if not math.isnan(_comp_map[c].delta)
+                    else f"{c} (n/a)"
                     for c in report.degraded_skills
                     if c in _comp_map
                 ]
@@ -1684,7 +1722,7 @@ def history(
                     {
                         "name": snap.name,
                         "created_at": snap.created_at.isoformat(),
-                        "overall": round(snap.overall_score(), 4),
+                        "overall": _safe_overall(snap),
                         "status": "degraded" if report.degraded_skills else "healthy",
                         "degraded_skills": report.degraded_skills,
                         "notes": ", ".join(dropped_notes) if dropped_notes else "",
@@ -1731,7 +1769,7 @@ def history(
             table.add_row(
                 name_str,
                 hr["created_at"][:16].replace("T", " "),
-                f"{hr['overall']:.3f}",
+                "-" if hr["overall"] is None else f"{hr['overall']:.3f}",
                 status_str,
                 notes,
             )
@@ -1783,9 +1821,14 @@ def history(
         prev = snaps[i - 1].category_scores() if i > 0 else None
         prev_overall = snaps[i - 1].overall_score() if i > 0 else None
 
-        overall_str = f"{snap.overall_score():.3f}"
-        if prev_overall is not None:
-            overall_str += f" {_trend(prev_overall, snap.overall_score())}"
+        curr_overall = snap.overall_score()
+        overall_str = "-" if math.isnan(curr_overall) else f"{curr_overall:.3f}"
+        if (
+            prev_overall is not None
+            and not math.isnan(curr_overall)
+            and not math.isnan(prev_overall)
+        ):
+            overall_str += f" {_trend(prev_overall, curr_overall)}"
 
         name_markup = (
             f"[bold green]{snap.name} ★[/bold green]" if snap.name == baseline else snap.name
@@ -1801,8 +1844,13 @@ def history(
                 row.append("-")
                 continue
             score = cat_scores[cat]
-            cell = f"{score:.3f}"
-            if prev is not None and cat in prev:
+            cell = "-" if math.isnan(score) else f"{score:.3f}"
+            if (
+                prev is not None
+                and cat in prev
+                and not math.isnan(score)
+                and not math.isnan(prev[cat])
+            ):
                 cell += f" {_trend(prev[cat], score)}"
             row.append(cell)
 
@@ -1813,19 +1861,20 @@ def history(
     # Summary line: overall drift from first to last shown snapshot.
     first_overall = snaps[0].overall_score()
     last_overall = snaps[-1].overall_score()
-    delta = last_overall - first_overall
-    direction = (
-        "[green]improved[/green]"
-        if delta > 0
-        else "[red]dropped[/red]"
-        if delta < 0
-        else "unchanged"
-    )
-    console.print(
-        f"\n  Overall score {direction} by [bold]{abs(delta):.3f}[/bold] "
-        f"across {len(snaps)} snapshots "
-        f"({snaps[0].name} → {snaps[-1].name})."
-    )
+    if not math.isnan(first_overall) and not math.isnan(last_overall):
+        delta = last_overall - first_overall
+        direction = (
+            "[green]improved[/green]"
+            if delta > 0
+            else "[red]dropped[/red]"
+            if delta < 0
+            else "unchanged"
+        )
+        console.print(
+            f"\n  Overall score {direction} by [bold]{abs(delta):.3f}[/bold] "
+            f"across {len(snaps)} snapshots "
+            f"({snaps[0].name} → {snaps[-1].name})."
+        )
     if baseline:
         console.print(f"[dim]  ★ = current baseline ({baseline})[/dim]")
 
@@ -2495,9 +2544,11 @@ def pull(
             mgr.base_dir,
             include_weights=not no_weights,
         )
+        overall = snap.overall_score()
+        overall_str = "-" if math.isnan(overall) else f"{overall:.3f}"
         console.print(
             f"[success]✓ Snapshot '{name}' pulled from {repo_id}. "
-            f"Overall score: {snap.overall_score():.3f}[/success]"
+            f"Overall score: {overall_str}[/success]"
         )
     except ImportError as exc:
         console.print(f"[red]Error:[/red] {exc}")
