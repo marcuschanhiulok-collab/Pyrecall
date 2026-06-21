@@ -54,6 +54,7 @@ def _make_mock_peft_model() -> MagicMock:
     outputs = MagicMock()
     outputs.hidden_states = [hidden] * 4
     outputs.loss = torch.tensor(1.0)
+
     # Return logits matching the input batch shape + device for compute_log_likelihood_batch.
     def _forward_side_effect(*args, **kwargs):
         input_ids = kwargs.get("input_ids", args[0] if args else None)
