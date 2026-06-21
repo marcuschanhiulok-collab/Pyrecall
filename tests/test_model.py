@@ -94,7 +94,6 @@ def patched_model(tmp_snapshot_dir: Path):
         patch("pyrecall.model.get_peft_model", return_value=mock_peft),
         patch("pyrecall.model.compute_embeddings", return_value=torch.randn(32)),
         patch("pyrecall.model.cosine_similarity", return_value=0.75),
-        patch("pyrecall.model.compute_log_likelihood", return_value=0.368),
         patch(
             "pyrecall.model.compute_log_likelihood_batch",
             side_effect=lambda model, tok, prompts, completions, **kw: [0.368] * len(prompts),

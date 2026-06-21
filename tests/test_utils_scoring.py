@@ -306,6 +306,7 @@ class TestComputeLogLikelihoodBatch:
     def test_batch_size_1_matches_single_call(self) -> None:
         """batch_size=1 must give the same score as a single-item batch."""
         import torch
+
         from pyrecall.utils import compute_log_likelihood_batch
 
         torch.manual_seed(42)

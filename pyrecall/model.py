@@ -41,7 +41,6 @@ from .snapshot import SkillScore, SkillSnapshot
 from .trackers import SnapshotTracker
 from .utils import (
     compute_embeddings,
-    compute_log_likelihood,
     compute_log_likelihood_batch,
     console,
     cosine_similarity,
