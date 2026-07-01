@@ -153,6 +153,16 @@ class TestInit:
         # Original config should be preserved
         assert config["model_name"] == "gpt2"
 
+    def test_from_config_non_dict_yaml_raises_clear_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("- item1\n- item2\n")  # a list, not a dict
+        result = runner.invoke(app, ["init", "--from-config", str(cfg)])
+        assert result.exit_code != 0
+        assert "mapping" in result.output.lower() or "error" in result.output.lower()
+
 
 # ── learn ─────────────────────────────────────────────────────────────────────
 
@@ -484,6 +494,64 @@ class TestLearn:
         mock_model.learn.assert_called_once()
         mock_model.snapshot.assert_called_once_with(name="after_v1", tracker=None)
 
+    def test_watch_every_passed_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["learn", str(data), "--watch-every", "5"])
+
+        assert mock_model.learn.call_args[1]["watch_every"] == 5
+
+    def test_watch_action_passed_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["learn", str(data), "--watch-action", "rollback"])
+
+        assert mock_model.learn.call_args[1]["watch_action"] == "rollback"
+
+    def test_watch_every_default_is_none(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["learn", str(data)])
+
+        assert mock_model.learn.call_args[1]["watch_every"] is None
+
+    def test_tracker_forwarded_to_learn(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._config(tmp_path)
+        data = tmp_path / "train.jsonl"
+        data.write_text('{"text": "hi"}\n')
+        mock_model = MagicMock()
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["learn", str(data), "--log-wandb"])
+
+        call_kwargs = mock_model.learn.call_args[1]
+        assert "tracker" in call_kwargs
+        assert call_kwargs["tracker"] is not None
+
 
 # ── snapshot ──────────────────────────────────────────────────────────────────
 
@@ -598,6 +666,21 @@ class TestSnapshot:
 
         config = json.loads((tmp_path / _CONFIG_FILE).read_text())
         assert config["baseline_snapshot"] == "new_snap"
+
+    def test_dry_run_does_not_update_baseline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, baseline="stable_baseline")
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("dry_snap")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(app, ["snapshot", "dry_snap", "--dry-run"])
+
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["baseline_snapshot"] == "stable_baseline"
 
 
 # ── check ─────────────────────────────────────────────────────────────────────
@@ -835,6 +918,103 @@ class TestCheckJson:
             result = runner.invoke(app, ["check", "--json"])
 
         assert result.exit_code == 2
+
+
+# ── check --save-report ───────────────────────────────────────────────────────
+
+
+class TestCheckSaveReport:
+    def test_save_report_json_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("before", {"coding": 0.8})
+        snap_b = _make_snapshot("after", {"coding": 0.79})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        out = tmp_path / "report.json"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["check", "--save-report", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        data = json.loads(out.read_text())
+        assert "is_healthy" in data
+        assert "comparisons" in data
+
+    def test_save_report_html_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("before", {"coding": 0.8})
+        snap_b = _make_snapshot("after", {"coding": 0.79})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        out = tmp_path / "report.html"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["check", "--save-report", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        content = out.read_text()
+        assert "<!DOCTYPE html>" in content
+        assert "pyrecall" in content
+
+    def test_save_report_md_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("before", {"coding": 0.8})
+        snap_b = _make_snapshot("after", {"coding": 0.79})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        out = tmp_path / "report.md"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["check", "--save-report", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        content = out.read_text()
+        assert "##" in content  # Markdown heading
+
+    def test_save_report_same_as_output(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """--save-report should produce identical output to --output."""
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("before", {"coding": 0.8})
+        snap_b = _make_snapshot("after", {"coding": 0.79})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        out1 = tmp_path / "report1.json"
+        out2 = tmp_path / "report2.json"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            runner.invoke(app, ["check", "--output", str(out1)])
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            runner.invoke(app, ["check", "--save-report", str(out2)])
+
+        assert out1.read_text() == out2.read_text()
+
+    def test_save_report_unknown_extension_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("before", {"coding": 0.8})
+        snap_b = _make_snapshot("after", {"coding": 0.79})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        out = tmp_path / "report.txt"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["check", "--save-report", str(out)])
+
+        assert result.exit_code == 1
+        assert "Unknown format" in result.output
 
 
 # ── check --watch ─────────────────────────────────────────────────────────────
@@ -1955,6 +2135,134 @@ class TestStatus:
         assert "-" in result.output
 
 
+# ── status --output ───────────────────────────────────────────────────────────
+
+
+class TestStatusOutput:
+    def test_output_json_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[_make_snapshot("v1", {"coding": 0.8})])
+        out = tmp_path / "status.json"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["status", "--output", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        data = json.loads(out.read_text())
+        assert data["model_name"] == "test/model"
+        assert len(data["snapshots"]) == 1
+        assert data["snapshots"][0]["name"] == "v1"
+
+    def test_output_csv_creates_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snaps = [_make_snapshot("v1", {"coding": 0.8}), _make_snapshot("v2", {"coding": 0.75})]
+        mgr = _make_mock_manager(snapshots=snaps)
+        out = tmp_path / "status.csv"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["status", "--output", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        content = out.read_text()
+        # Filter out empty lines
+        lines = [line for line in content.splitlines() if line.strip()]
+        assert lines[0].startswith("name,created_at,overall")
+        assert "coding" in lines[0]
+        assert len(lines) == 3  # header + 2 rows
+
+    def test_output_html_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[_make_snapshot("v1", {"coding": 0.8})])
+        out = tmp_path / "status.html"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["status", "--output", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        content = out.read_text()
+        assert "<!DOCTYPE html>" in content
+        assert "v1" in content
+        assert "pyrecall" in content
+
+    def test_output_json_matches_json_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[_make_snapshot("v1", {"coding": 0.8})])
+        out = tmp_path / "status.json"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            runner.invoke(app, ["status", "--output", str(out)])
+
+        data = json.loads(out.read_text())
+        assert "model_name" in data
+        assert "snapshots" in data
+        assert data["snapshots"][0]["name"] == "v1"
+
+    def test_output_csv_has_all_fields(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import csv as _csv
+
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, baseline="v1")
+        snap = _make_snapshot("v1", {"coding": 0.8, "reasoning": 0.7})
+        snap.hub_repo = "my-org/my-model"
+        snap.tags = {"commit": "abc123"}
+        mgr = _make_mock_manager(snapshots=[snap])
+        out = tmp_path / "status.csv"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["status", "--output", str(out)])
+
+        assert result.exit_code == 0
+        rows = list(_csv.DictReader(out.read_text().splitlines()))
+        assert rows[0]["name"] == "v1"
+        assert rows[0]["hub_repo"] == "my-org/my-model"
+        assert "commit=abc123" in rows[0]["tags"]
+        assert rows[0]["is_baseline"] == "true"
+
+    def test_output_unknown_extension_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[_make_snapshot("v1")])
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["status", "--output", str(tmp_path / "status.txt")])
+
+        assert result.exit_code == 1
+        assert "Unknown format" in result.output
+
+    def test_output_empty_snapshots_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[])
+        out = tmp_path / "status.json"
+
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["status", "--output", str(out)])
+
+        assert result.exit_code == 0
+        assert out.exists()
+        data = json.loads(out.read_text())
+        assert data["snapshots"] == []
+
+
 # ── history ───────────────────────────────────────────────────────────────────
 
 
@@ -2418,3 +2726,374 @@ class TestLive:
             result = runner.invoke(app, ["live", "clear", "--yes"])
         assert result.exit_code == 0
         assert "No" in result.output
+
+
+# ── init --from-config ────────────────────────────────────────────────────────
+
+
+class TestInitFromConfig:
+    def test_yaml_values_written_to_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("forgetting_threshold: 0.05\nbatch_size: 8\n")
+        result = runner.invoke(app, ["init", "--from-config", str(cfg)])
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["forgetting_threshold"] == pytest.approx(0.05)
+        assert config["batch_size"] == 8
+
+    def test_toml_values_written_to_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "config.toml"
+        cfg.write_text("forgetting_threshold = 0.07\nbatch_size = 8\n")
+        result = runner.invoke(app, ["init", "--from-config", str(cfg)])
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["forgetting_threshold"] == pytest.approx(0.07)
+
+    def test_file_values_applied_to_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("forgetting_threshold: 0.05\nbatch_size: 16\n")
+        result = runner.invoke(app, ["init", "--from-config", str(cfg)])
+        assert result.exit_code == 0
+        config = json.loads((tmp_path / _CONFIG_FILE).read_text())
+        assert config["forgetting_threshold"] == pytest.approx(0.05)
+        assert config["batch_size"] == 16
+
+    def test_invalid_threshold_in_file_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("forgetting_threshold: 5.0\n")
+        result = runner.invoke(app, ["init", "--from-config", str(cfg)])
+        assert result.exit_code != 0
+        assert "threshold" in result.output.lower() or "error" in result.output.lower()
+
+    def test_invalid_strategy_in_file_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("strategy: bad_strategy\n")
+        result = runner.invoke(app, ["init", "--from-config", str(cfg)])
+        assert result.exit_code != 0
+        assert "strategy" in result.output.lower() or "error" in result.output.lower()
+
+    def test_missing_config_file_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--from-config", str(tmp_path / "nonexistent.yaml")])
+        assert result.exit_code != 0
+
+
+# ── snapshot --tag ────────────────────────────────────────────────────────────
+
+
+class TestSnapshotTags:
+    def test_single_tag_passed_to_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(app, ["snapshot", "v1", "--tag", "commit=abc123f"])
+
+        assert result.exit_code == 0
+        call_kwargs = mock_model.snapshot.call_args[1]
+        assert call_kwargs["tags"] == {"commit": "abc123f"}
+
+    def test_multiple_tags_merged(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(
+                app,
+                ["snapshot", "v1", "--tag", "commit=abc123f", "--tag", "dataset=v2"],
+            )
+
+        assert result.exit_code == 0
+        call_kwargs = mock_model.snapshot.call_args[1]
+        assert call_kwargs["tags"] == {"commit": "abc123f", "dataset": "v2"}
+
+    def test_no_tags_passes_empty_dict(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            runner.invoke(app, ["snapshot", "v1"])
+
+        call_kwargs = mock_model.snapshot.call_args[1]
+        assert call_kwargs["tags"] == {}
+
+    def test_malformed_tag_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mock_model = MagicMock()
+        mock_model.snapshot.return_value = _make_snapshot("v1")
+
+        with patch("pyrecall.model.Model", return_value=mock_model):
+            result = runner.invoke(app, ["snapshot", "v1", "--tag", "no-equals-sign"])
+
+        assert result.exit_code != 0
+
+
+# ── category threshold validation ─────────────────────────────────────────────
+
+
+class TestCategoryThresholdValidation:
+    def test_valid_threshold_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_before = _make_snapshot("before", {"coding": 0.8})
+        snap_after = _make_snapshot("after", {"coding": 0.7})
+        mgr = _make_mock_manager(
+            [snap_before, snap_after],
+            {"before": snap_before, "after": snap_after},
+        )
+        with patch("pyrecall.cli._build_rollback_manager", return_value=mgr):
+            result = runner.invoke(
+                app,
+                ["diff", "before", "after", "--category-threshold", "coding=0.5"],
+            )
+        assert result.exit_code in (0, 2)
+
+    def test_threshold_above_one_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_before = _make_snapshot("before", {"coding": 0.8})
+        snap_after = _make_snapshot("after", {"coding": 0.7})
+        mgr = _make_mock_manager(
+            [snap_before, snap_after],
+            {"before": snap_before, "after": snap_after},
+        )
+        with patch("pyrecall.cli._build_rollback_manager", return_value=mgr):
+            result = runner.invoke(
+                app,
+                ["diff", "before", "after", "--category-threshold", "coding=2.0"],
+            )
+        assert result.exit_code != 0
+        assert "threshold" in result.output.lower() or "invalid" in result.output.lower()
+
+    def test_threshold_zero_rejected(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_before = _make_snapshot("before", {"coding": 0.8})
+        snap_after = _make_snapshot("after", {"coding": 0.7})
+        mgr = _make_mock_manager(
+            [snap_before, snap_after],
+            {"before": snap_before, "after": snap_after},
+        )
+        with patch("pyrecall.cli._build_rollback_manager", return_value=mgr):
+            result = runner.invoke(
+                app,
+                ["diff", "before", "after", "--category-threshold", "coding=0.0"],
+            )
+        assert result.exit_code != 0
+
+    def test_negative_threshold_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_before = _make_snapshot("before", {"coding": 0.8})
+        snap_after = _make_snapshot("after", {"coding": 0.7})
+        mgr = _make_mock_manager(
+            [snap_before, snap_after],
+            {"before": snap_before, "after": snap_after},
+        )
+        with patch("pyrecall.cli._build_rollback_manager", return_value=mgr):
+            result = runner.invoke(
+                app,
+                ["diff", "before", "after", "--category-threshold", "coding=-0.1"],
+            )
+        assert result.exit_code != 0
+
+
+# ── push / pull CLI ───────────────────────────────────────────────────────────
+
+
+class TestPushCommand:
+    def test_fails_without_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["push", "before_v1", "--to", "org/repo"])
+        assert result.exit_code == 1
+
+    def test_fails_when_snapshot_not_found(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager([])
+        with patch("pyrecall.cli._build_rollback_manager", return_value=mgr):
+            result = runner.invoke(app, ["push", "missing_snap", "--to", "org/repo"])
+        assert result.exit_code == 1
+        assert "missing_snap" in result.output
+
+    def test_calls_push_snapshot_with_repo(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap = _make_snapshot("before_v1")
+        mgr = _make_mock_manager([snap], {"before_v1": snap})
+        mgr.base_dir = tmp_path / "snapshots"
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch("pyrecall.hub.push_snapshot", return_value="https://hub/url") as mock_push,
+        ):
+            result = runner.invoke(app, ["push", "before_v1", "--to", "org/repo"])
+
+        assert result.exit_code == 0
+        mock_push.assert_called_once()
+        call_kwargs = mock_push.call_args
+        assert call_kwargs[0][2] == "org/repo"
+
+    def test_no_weights_flag_passed_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap = _make_snapshot("before_v1")
+        mgr = _make_mock_manager([snap], {"before_v1": snap})
+        mgr.base_dir = tmp_path / "snapshots"
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch("pyrecall.hub.push_snapshot", return_value="https://hub/url") as mock_push,
+        ):
+            runner.invoke(app, ["push", "before_v1", "--to", "org/repo", "--no-weights"])
+
+        call_kwargs = mock_push.call_args[1]
+        assert call_kwargs["include_weights"] is False
+
+    def test_success_output_contains_snapshot_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap = _make_snapshot("before_v1")
+        mgr = _make_mock_manager([snap], {"before_v1": snap})
+        mgr.base_dir = tmp_path / "snapshots"
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch("pyrecall.hub.push_snapshot", return_value="https://hub/url"),
+        ):
+            result = runner.invoke(app, ["push", "before_v1", "--to", "org/repo"])
+
+        assert "before_v1" in result.output
+
+
+class TestPullCommand:
+    def test_fails_without_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["pull", "before_v1", "--from-repo", "org/repo"])
+        assert result.exit_code == 1
+
+    def test_calls_pull_snapshot_with_repo(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager([])
+        mgr.base_dir = tmp_path / "snapshots"
+        pulled_snap = _make_snapshot("before_v1")
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch("pyrecall.hub.pull_snapshot", return_value=pulled_snap) as mock_pull,
+        ):
+            result = runner.invoke(app, ["pull", "before_v1", "--from-repo", "org/repo"])
+
+        assert result.exit_code == 0
+        mock_pull.assert_called_once()
+        call_args = mock_pull.call_args[0]
+        assert call_args[0] == "before_v1"
+        assert call_args[2] == "org/repo"
+
+    def test_no_weights_flag_passed_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager([])
+        mgr.base_dir = tmp_path / "snapshots"
+        pulled_snap = _make_snapshot("before_v1")
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch("pyrecall.hub.pull_snapshot", return_value=pulled_snap) as mock_pull,
+        ):
+            runner.invoke(
+                app,
+                ["pull", "before_v1", "--from-repo", "org/repo", "--no-weights"],
+            )
+
+        call_kwargs = mock_pull.call_args[1]
+        assert call_kwargs["include_weights"] is False
+
+    def test_success_output_contains_snapshot_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager([])
+        mgr.base_dir = tmp_path / "snapshots"
+        pulled_snap = _make_snapshot("before_v1")
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch("pyrecall.hub.pull_snapshot", return_value=pulled_snap),
+        ):
+            result = runner.invoke(app, ["pull", "before_v1", "--from-repo", "org/repo"])
+
+        assert "before_v1" in result.output
+
+    def test_file_not_found_on_hub_exits_one(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager([])
+        mgr.base_dir = tmp_path / "snapshots"
+
+        with (
+            patch("pyrecall.cli._build_rollback_manager", return_value=mgr),
+            patch(
+                "pyrecall.hub.pull_snapshot",
+                side_effect=FileNotFoundError("not found on hub"),
+            ),
+        ):
+            result = runner.invoke(app, ["pull", "missing_snap", "--from-repo", "org/repo"])
+
+        assert result.exit_code == 1

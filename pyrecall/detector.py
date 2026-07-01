@@ -378,6 +378,8 @@ class ForgettingReport:
             )
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        snap_before_safe = _html.escape(self.snapshot_before)
+        snap_after_safe = _html.escape(self.snapshot_after)
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -405,8 +407,8 @@ class ForgettingReport:
 <h1>pyrecall — Forgetting Report</h1>
 <p class="meta">
   Generated {ts} &nbsp;|&nbsp;
-  <strong>Before:</strong> {self.snapshot_before} &nbsp;→&nbsp;
-  <strong>After:</strong> {self.snapshot_after} &nbsp;|&nbsp;
+  <strong>Before:</strong> {snap_before_safe} &nbsp;→&nbsp;
+  <strong>After:</strong> {snap_after_safe} &nbsp;|&nbsp;
   Threshold: {self.threshold * 100:.0f}%
 </p>
 <span class="badge">{status_text}</span>
@@ -514,8 +516,8 @@ class ForgettingReport:
 
             table.add_row(
                 comp.category,
-                f"{comp.score_before:.3f}",
-                f"{comp.score_after:.3f}",
+                "n/a" if math.isnan(comp.score_before) else f"{comp.score_before:.3f}",
+                "n/a" if math.isnan(comp.score_after) else f"{comp.score_after:.3f}",
                 f"[{delta_style}]{delta_str}[/{delta_style}]",
                 cohen_str,
                 status_markup,
@@ -568,14 +570,22 @@ class ForgettingReport:
                 pt.add_column("After", justify="right")
                 pt.add_column("Δ", justify="right")
                 for p in prompts:
-                    sign = "+" if p.delta >= 0 else ""
-                    delta_style = "red" if p.delta < 0 else "green"
-                    pt.add_row(
-                        p.prompt,
-                        f"{p.score_before:.3f}",
-                        f"{p.score_after:.3f}",
-                        f"[{delta_style}]{sign}{p.delta:.3f}[/{delta_style}]",
-                    )
+                    if math.isnan(p.delta):
+                        pt.add_row(
+                            p.prompt,
+                            "n/a" if math.isnan(p.score_before) else f"{p.score_before:.3f}",
+                            "n/a" if math.isnan(p.score_after) else f"{p.score_after:.3f}",
+                            "[dim]n/a[/dim]",
+                        )
+                    else:
+                        sign = "+" if p.delta >= 0 else ""
+                        delta_style = "red" if p.delta < 0 else "green"
+                        pt.add_row(
+                            p.prompt,
+                            f"{p.score_before:.3f}",
+                            f"{p.score_after:.3f}",
+                            f"[{delta_style}]{sign}{p.delta:.3f}[/{delta_style}]",
+                        )
                 console.print(pt)
                 console.print()
 

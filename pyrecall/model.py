@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import threading
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +28,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
+    TextIteratorStreamer,
     Trainer,
     TrainerCallback,
     TrainingArguments,
@@ -41,7 +43,7 @@ from .snapshot import SkillScore, SkillSnapshot
 from .trackers import SnapshotTracker
 from .utils import (
     compute_embeddings,
-    compute_log_likelihood,
+    compute_log_likelihood_batch,
     console,
     cosine_similarity,
     get_logger,
@@ -165,6 +167,79 @@ class _TrackerStepCallback(TrainerCallback):
                         logger.warning("Tracker %s failed log_step: %s", type(t).__name__, exc)
 
 
+class _WatchStopSignal(Exception):
+    """Raised inside _WatchCallback to abort training when watch_action='stop'."""
+
+    def __init__(self, report: ForgettingReport) -> None:
+        self.report = report
+
+
+class _WatchRollbackSignal(Exception):
+    """Raised inside _WatchCallback to trigger rollback when watch_action='rollback'."""
+
+    def __init__(self, report: ForgettingReport) -> None:
+        self.report = report
+
+
+class _WatchCallback(TrainerCallback):
+    """Runs benchmarks and checks for forgetting at configurable epoch intervals."""
+
+    def __init__(
+        self,
+        model_ref: Model,
+        baseline_name: str,
+        watch_every: int,
+        watch_action: str,
+    ) -> None:
+        self._model_ref = model_ref
+        self._baseline_name = baseline_name
+        self._watch_every = watch_every
+        self._watch_action = watch_action
+
+    def on_epoch_end(self, args, state, control, **kwargs) -> None:  # type: ignore[override]
+        epoch = round(state.epoch)
+        if epoch % self._watch_every != 0:
+            return
+
+        snap_name = f"{self._baseline_name}__epoch{epoch}"
+        console.print(f"[info]Watch checkpoint at epoch {epoch} — running benchmarks…[/info]")
+
+        scores = self._model_ref._run_benchmarks()
+        snap = SkillSnapshot(name=snap_name, model_name=self._model_ref.model_name, scores=scores)
+        self._model_ref.rollback_manager.save(
+            snap,
+            self._model_ref.model,
+            compression=self._model_ref._snapshot_compression,
+        )
+        console.print(f"[dim]  Saved watch snapshot '{snap_name}'.[/dim]")
+
+        try:
+            baseline_snap = self._model_ref.rollback_manager.load_snapshot(self._baseline_name)
+        except Exception:
+            logger.warning(
+                "Watch: could not load baseline '%s' — skipping check.", self._baseline_name
+            )
+            return
+
+        report = self._model_ref.detector.compare(baseline_snap, snap)
+
+        if report.is_healthy:
+            console.print(f"[success]  ✓ Epoch {epoch}: no forgetting detected.[/success]")
+            return
+
+        console.print(f"[warning]  ⚠ Epoch {epoch}: forgetting detected.[/warning]")
+        _fire_callbacks(self._model_ref._on_forgetting, report)
+
+        if self._watch_action == "warn":
+            pass
+        elif self._watch_action == "stop":
+            control.should_training_stop = True
+            raise _WatchStopSignal(report)
+        elif self._watch_action == "rollback":
+            control.should_training_stop = True
+            raise _WatchRollbackSignal(report)
+
+
 class Model:
     """
     A HuggingFace causal LM wrapped for continuous fine-tuning.
@@ -213,6 +288,7 @@ class Model:
         on_healthy: ForgettingCallback | list[ForgettingCallback] | None = None,
         snapshot_compression: str = "none",
         gradient_checkpointing: bool = False,
+        benchmark_batch_size: int = 8,
     ) -> None:
         """
         Load *model_name* from HuggingFace Hub (or local cache) and wrap it with LoRA.
@@ -250,6 +326,10 @@ class Model:
                 ``"lz4"`` (requires ``pip install lz4``).
             gradient_checkpointing: Enable gradient checkpointing during training to
                 reduce GPU memory usage by ~40 % at the cost of ~20 % slower training.
+            benchmark_batch_size: Number of benchmark prompts scored in a single forward
+                pass during :meth:`snapshot` and :meth:`check`.  Default 8 gives a
+                4–8× speedup over the sequential path.  Set to 1 to restore the
+                old sequential behaviour.
         """
         if strategy not in ("lora", "qlora"):
             raise PyrecallError(
@@ -285,6 +365,7 @@ class Model:
         )
         self._snapshot_compression = snapshot_compression
         self._gradient_checkpointing = gradient_checkpointing
+        self._benchmark_batch_size = benchmark_batch_size
         # Replay buffer lives under ~/.pyrecall/replay/ by default.
         # When snapshot_dir is overridden (e.g. in tests), put replay alongside it
         # so tests stay isolated, but keep it separate from the snapshots tree.
@@ -428,17 +509,17 @@ class Model:
         scores = self._run_benchmarks()
         snap = SkillSnapshot(name=name, model_name=self.model_name, scores=scores, tags=tags or {})
 
+        _overall = snap.overall_score()
+        _overall_str = "-" if math.isnan(_overall) else f"{_overall:.3f}"
         if not dry_run:
             self.rollback_manager.save(snap, self.model, compression=self._snapshot_compression)
             self._set_baseline(name)
             console.print(
-                f"[success]✓ Snapshot '{name}' saved. "
-                f"Overall score: {snap.overall_score():.3f}[/success]"
+                f"[success]✓ Snapshot '{name}' saved. Overall score: {_overall_str}[/success]"
             )
         else:
             console.print(
-                f"[info]Dry run complete. Overall score: {snap.overall_score():.3f} "
-                f"(not saved)[/info]"
+                f"[info]Dry run complete. Overall score: {_overall_str} (not saved)[/info]"
             )
 
         if tracker is not None:
@@ -463,6 +544,10 @@ class Model:
         replay_weights: dict[str, float] | ForgettingReport | None = None,
         stream: bool = False,
         tracker: SnapshotTracker | list[SnapshotTracker] | None = None,
+        watch_every: int | None = None,
+        watch_action: str = "warn",
+        format: str = "auto",
+        messages_column: str = "messages",
     ) -> None:
         """
         Fine-tune the model on *data_path* using LoRA.
@@ -496,6 +581,12 @@ class Model:
             tracker: An optional :class:`~pyrecall.trackers.SnapshotTracker` (or list)
                 that implements ``log_step(step, loss)`` to receive per-step training
                 loss.  Trackers that don't implement ``log_step`` are silently skipped.
+            format: Training data format — ``"auto"`` (default), ``"text"``,
+                ``"messages"``, or ``"prompt_response"``.  In ``"auto"`` mode the
+                format is inferred from the column names.
+            messages_column: Name of the column holding chat messages when
+                *format* is ``"messages"`` or when auto-detection picks up that
+                column.  Default ``"messages"``.
         """
         batch_size = batch_size if batch_size is not None else self.batch_size
         learning_rate = learning_rate if learning_rate is not None else self.learning_rate
@@ -547,7 +638,85 @@ class Model:
 
         if is_empty:
             raise PyrecallError(f"Training data '{data_path}' is empty.")
-        if "text" in dataset.column_names:
+
+        _VALID_FORMATS = ("auto", "text", "messages", "prompt_response")
+        if format not in _VALID_FORMATS:
+            raise PyrecallError(
+                f"Unknown format '{format}'. Use one of: {', '.join(_VALID_FORMATS)}."
+            )
+
+        # Resolve format for "auto" mode by inspecting column names.
+        resolved_format = format
+        if format == "auto":
+            if "text" in dataset.column_names:
+                resolved_format = "text"
+            elif messages_column in dataset.column_names:
+                resolved_format = "messages"
+            elif "prompt" in dataset.column_names and "response" in dataset.column_names:
+                resolved_format = "prompt_response"
+            else:
+                resolved_format = "text"  # fall through to existing column search
+
+        if resolved_format == "messages":
+            # Apply the tokenizer's chat template to convert messages → flat text.
+            col = messages_column
+            if col not in dataset.column_names:
+                raise PyrecallError(
+                    f"messages_column '{col}' not found in '{data_path}'. "
+                    f"Columns found: {dataset.column_names}."
+                )
+            first = dataset[col][0]
+            if not isinstance(first, list) or not all(isinstance(m, dict) for m in first):
+                raise PyrecallError(
+                    f"Column '{col}' must contain lists of dicts with 'role' and 'content' keys. "
+                    f"Got: {type(first).__name__}."
+                )
+
+            def _apply_chat_template(batch: dict) -> dict:
+                texts = []
+                for msgs in batch[col]:
+                    try:
+                        text = self.tokenizer.apply_chat_template(
+                            msgs,
+                            tokenize=False,
+                            add_generation_prompt=False,
+                        )
+                    except Exception:
+                        # Fallback for tokenizers without a chat template.
+                        parts = []
+                        for m in msgs:
+                            role = m.get("role", "user")
+                            content = m.get("content", "")
+                            parts.append(f"### {role.capitalize()}: {content}")
+                        text = "\n\n".join(parts)
+                    texts.append(text)
+                return {"text": texts}
+
+            dataset = dataset.map(
+                _apply_chat_template, batched=True, remove_columns=dataset.column_names
+            )
+            text_col = "text"
+
+        elif resolved_format == "prompt_response":
+            if "prompt" not in dataset.column_names or "response" not in dataset.column_names:
+                raise PyrecallError(
+                    f"format='prompt_response' requires 'prompt' and 'response' columns. "
+                    f"Columns found: {dataset.column_names}."
+                )
+
+            def _flatten_prompt_response(batch: dict) -> dict:
+                texts = [
+                    f"### Human: {p}\n\n### Assistant: {r}"
+                    for p, r in zip(batch["prompt"], batch["response"])
+                ]
+                return {"text": texts}
+
+            dataset = dataset.map(
+                _flatten_prompt_response, batched=True, remove_columns=dataset.column_names
+            )
+            text_col = "text"
+
+        elif "text" in dataset.column_names:
             text_col = "text"
         else:
             text_col = None
@@ -652,6 +821,13 @@ class Model:
 
         collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)
 
+        _VALID_WATCH_ACTIONS = ("warn", "stop", "rollback")
+        if watch_action not in _VALID_WATCH_ACTIONS:
+            raise PyrecallError(
+                f"Unknown watch_action '{watch_action}'. "
+                f"Use one of: {', '.join(_VALID_WATCH_ACTIONS)}."
+            )
+
         trackers: list = tracker if isinstance(tracker, list) else ([tracker] if tracker else [])
         callbacks: list[TrainerCallback]
         if stream:
@@ -660,6 +836,25 @@ class Model:
             callbacks = [_TrackerStepCallback(trackers=trackers)]
         else:
             callbacks = []
+
+        if watch_every is not None:
+            if watch_every < 1:
+                raise PyrecallError("watch_every must be >= 1.")
+            baseline = self._baseline_snapshot_name
+            if baseline is None:
+                raise PyrecallError(
+                    "watch_every requires a baseline snapshot. "
+                    "Call model.snapshot() before model.learn()."
+                )
+            callbacks.append(
+                _WatchCallback(
+                    model_ref=self,
+                    baseline_name=baseline,
+                    watch_every=watch_every,
+                    watch_action=watch_action,
+                )
+            )
+
         trainer = Trainer(
             model=self.model,
             args=args,
@@ -667,6 +862,12 @@ class Model:
             data_collator=collator,
             callbacks=callbacks,
         )
+        # Remove HuggingFace's default PrinterCallback — pyrecall uses its own
+        # Rich progress bar (or TrackerStepCallback) and the raw JSON log lines
+        # are confusing to users who aren't familiar with HF Trainer internals.
+        from transformers import PrinterCallback
+
+        trainer.remove_callback(PrinterCallback)
 
         # Find latest checkpoint when resuming
         resume_from = None
@@ -685,6 +886,25 @@ class Model:
         self.model.train()
         try:
             trainer.train(resume_from_checkpoint=resume_from)
+        except _WatchStopSignal as exc:
+            if streaming_cb is not None:
+                streaming_cb._progress.stop()
+            self.model.eval()
+            console.print("[warning]Training stopped by watch — forgetting detected.[/warning]")
+            _fire_callbacks(self._on_forgetting, exc.report)
+            return
+        except _WatchRollbackSignal as exc:
+            if streaming_cb is not None:
+                streaming_cb._progress.stop()
+            self.model.eval()
+            console.print(
+                "[warning]Training stopped — rolling back to baseline snapshot.[/warning]"
+            )
+            _fire_callbacks(self._on_forgetting, exc.report)
+            baseline = self._baseline_snapshot_name
+            if baseline:
+                self.rollback(to=baseline)
+            return
         except Exception:
             if streaming_cb is not None:
                 streaming_cb._progress.stop()
@@ -708,8 +928,8 @@ class Model:
         Must be called after at least one :meth:`snapshot` call.
 
         Args:
-            name: Optional name for the post-training snapshot. When ``None``
-                the snapshot is saved as ``<baseline>__after``. Providing a
+            name: Name for the post-training snapshot saved to disk. When
+                ``None`` it defaults to ``<baseline>__after``. Providing a
                 name lets you call ``check()`` multiple times without
                 overwriting the previous after-snapshot.
 
@@ -735,11 +955,9 @@ class Model:
 
         console.print("[info]Running post-training benchmarks…[/info]")
         after_scores = self._run_benchmarks()
-        after = SkillSnapshot(
-            name=name if name is not None else f"{self._baseline_snapshot_name}__after",
-            model_name=self.model_name,
-            scores=after_scores,
-        )
+        after_name = name if name is not None else f"{self._baseline_snapshot_name}__after"
+        after = SkillSnapshot(name=after_name, model_name=self.model_name, scores=after_scores)
+        self.rollback_manager.save(after, self.model, compression=self._snapshot_compression)
 
         report = self.detector.compare(before, after)
         report.print()
@@ -862,11 +1080,47 @@ class Model:
         new_tokens = output_ids[0][inputs["input_ids"].shape[1] :]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)  # type: ignore[return-value]
 
+    def generate_stream(
+        self,
+        prompt: str,
+        max_new_tokens: int = 200,
+    ):
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length,
+        ).to(self.device)
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+
+        thread = threading.Thread(
+            target=self.model.generate,
+            kwargs={
+                **inputs,
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,
+                "pad_token_id": self.tokenizer.eos_token_id,
+                "streamer": streamer,
+            },
+        )
+
+        thread.start()
+
+        yield from streamer
+
+        thread.join()
+
     def serve(
         self,
         port: int = 8000,
         live_learning: bool = False,
         live_batch_size: int = 50,
+        streaming: bool = True,
     ) -> None:
         """
         Start a FastAPI inference server.
@@ -887,9 +1141,12 @@ class Model:
                 Only used when *live_learning* is True.
         """
         try:
+            import json
+
             import uvicorn
             from fastapi import FastAPI
             from fastapi.middleware.cors import CORSMiddleware
+            from fastapi.responses import StreamingResponse
             from pydantic import BaseModel as _Base
         except ImportError as exc:
             raise PyrecallError(
@@ -897,10 +1154,12 @@ class Model:
                 "Install it with: pip install pyrecall[serve]"
             ) from exc
 
+        from . import __version__ as _pyrecall_version
+
         app = FastAPI(
             title="pyrecall",
             description=f"Serving {self.model_name}",
-            version="0.1.0",
+            version=_pyrecall_version,
         )
         app.add_middleware(
             CORSMiddleware,
@@ -927,12 +1186,45 @@ class Model:
             response: str
             model: str
 
-        @app.post("/generate", response_model=GenerateResponse)
-        async def _generate(req: GenerateRequest) -> GenerateResponse:
-            text = self.generate(req.prompt, req.max_new_tokens)
-            if learner:
-                learner.record(req.prompt, text)
-            return GenerateResponse(response=text, model=self.model_name)
+        @app.post("/generate")
+        async def _generate_stream(req: GenerateRequest):
+
+            def event_stream():
+                full_text = ""
+
+                for token in self.generate_stream(
+                    req.prompt,
+                    req.max_new_tokens,
+                ):
+                    full_text += token
+
+                    payload = {
+                        "token": token,
+                        "model": self.model_name,
+                        "done": False,
+                    }
+
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                final_payload = {
+                    "token": "",
+                    "model": self.model_name,
+                    "done": True,
+                }
+
+                yield f"data: {json.dumps(final_payload)}\n\n"
+
+                if learner:
+                    learner.record(req.prompt, full_text)
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
 
         @app.get("/health")
         async def _health() -> dict[str, Any]:
@@ -1018,9 +1310,11 @@ class Model:
             self.rollback_manager.base_dir,
             include_weights=include_weights,
         )
+        _ov = snap.overall_score()
+        _ov_str = "-" if math.isnan(_ov) else f"{_ov:.3f}"
         console.print(
             f"[success]✓ Snapshot '{name}' pulled from {repo_id}. "
-            f"Overall score: {snap.overall_score():.3f}[/success]"
+            f"Overall score: {_ov_str}[/success]"
         )
         return snap
 
@@ -1048,26 +1342,43 @@ class Model:
         ) as progress:
             task = progress.add_task("Benchmarking", total=len(all_benchmarks))
 
-            for bench in all_benchmarks:
-                progress.update(
-                    task,
-                    description=f"Benchmarking  [dim cyan]{bench.category}[/dim cyan]",
-                )
-
-                if self.scoring_method == "log_likelihood":
-                    score = compute_log_likelihood(
+            if self.scoring_method == "log_likelihood":
+                # Score in batches; generate responses sequentially for storage.
+                batch_size = max(1, self._benchmark_batch_size)
+                for batch_start in range(0, len(all_benchmarks), batch_size):
+                    batch = all_benchmarks[batch_start : batch_start + batch_size]
+                    batch_scores = compute_log_likelihood_batch(
                         self.model,
                         self.tokenizer,
-                        bench.prompt,
-                        bench.reference_answer,
+                        [b.prompt for b in batch],
+                        [b.reference_answer for b in batch],
                         device=self.device,  # type: ignore[arg-type]
                         max_length=self.max_length,
                     )
-                    # Still generate for human-readable storage / --verbose display
-                    response = self.generate(bench.prompt)
-                    if not response.strip():
-                        response = "[no response]"
-                else:
+                    for bench, score in zip(batch, batch_scores):
+                        progress.update(
+                            task,
+                            description=f"Benchmarking  [dim cyan]{bench.category}[/dim cyan]",
+                        )
+                        response = self.generate(bench.prompt)
+                        if not response.strip():
+                            response = "[no response]"
+                        scores.append(
+                            SkillScore(
+                                category=bench.category,
+                                prompt=bench.prompt,
+                                response=response,
+                                score=score,
+                                scoring_method=self.scoring_method,
+                            )
+                        )
+                        progress.advance(task)
+            else:
+                for bench in all_benchmarks:
+                    progress.update(
+                        task,
+                        description=f"Benchmarking  [dim cyan]{bench.category}[/dim cyan]",
+                    )
                     response = self.generate(bench.prompt)
                     if not response.strip():
                         response = "[no response]"
@@ -1085,18 +1396,16 @@ class Model:
                     )
                     raw_sim = cosine_similarity(resp_emb, ref_emb)
                     score = (raw_sim + 1.0) / 2.0
-
-                scores.append(
-                    SkillScore(
-                        category=bench.category,
-                        prompt=bench.prompt,
-                        response=response,
-                        score=score,
-                        scoring_method=self.scoring_method,
+                    scores.append(
+                        SkillScore(
+                            category=bench.category,
+                            prompt=bench.prompt,
+                            response=response,
+                            score=score,
+                            scoring_method=self.scoring_method,
+                        )
                     )
-                )
-
-                progress.advance(task)
+                    progress.advance(task)
 
         return scores
 

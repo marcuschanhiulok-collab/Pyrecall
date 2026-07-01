@@ -151,12 +151,18 @@ def _parse_category_thresholds(raw: list[str]) -> dict[str, float]:
             )
         cat, _, val = item.partition("=")
         try:
-            result[cat.strip()] = float(val.strip())
+            v = float(val.strip())
         except ValueError:
             raise typer.BadParameter(
                 f"Threshold value must be a number, got '{val}'",
                 param_hint="--category-threshold",
             )
+        if not 0.0 < v <= 1.0:
+            raise typer.BadParameter(
+                f"Threshold value must be between 0 and 1, got '{v}'",
+                param_hint="--category-threshold",
+            )
+        result[cat.strip()] = v
     return result
 
 
@@ -201,7 +207,6 @@ def _load_init_config(path: str) -> dict:
             with open(config_path, encoding="utf-8") as f:
                 try:
                     data = yaml.safe_load(f)
-                    return data
                 except yaml.YAMLError as exc:
                     raise typer.BadParameter(f"Invalid YAML config: {exc}") from exc
 
@@ -209,13 +214,14 @@ def _load_init_config(path: str) -> dict:
             with open(config_path, "rb") as f:
                 try:
                     data = tomllib.load(f)
-                    return data
                 except tomllib.TOMLDecodeError as exc:
                     raise typer.BadParameter(f"Invalid TOML config: {exc}") from exc
 
         else:
             raise typer.BadParameter(f"Unsupported config extension: {suffix}")
 
+    except typer.BadParameter:
+        raise
     except Exception as exc:
         raise typer.BadParameter(f"Failed to parse config file: {exc}") from exc
 
@@ -374,6 +380,23 @@ def init(
 
     config.update({k: v for k, v in config_values.items() if v is not None})
 
+    # Re-validate after config-file override so bad values can't bypass CLI checks.
+    config_errors: list[str] = []
+    _ft = config.get("forgetting_threshold")
+    _final_threshold: float = float(_ft) if isinstance(_ft, (int, float)) else threshold
+    if not 0.0 < _final_threshold <= 1.0:
+        config_errors.append(f"forgetting_threshold must be > 0 and <= 1, got {_final_threshold}")
+    if config.get("strategy") not in ("lora", "qlora"):
+        config_errors.append(f"strategy must be 'lora' or 'qlora', got '{config.get('strategy')}'")
+    if config.get("scoring_method") not in ("log_likelihood", "cosine"):
+        config_errors.append(
+            f"scoring_method must be 'log_likelihood' or 'cosine', got '{config.get('scoring_method')}'"
+        )
+    if config_errors:
+        for msg in config_errors:
+            console.print(f"[red]Error (from config file):[/red] {msg}")
+        raise typer.Exit(1)
+
     _write_config(config)
 
     model = model or config_values.get("model")
@@ -396,7 +419,7 @@ def learn(
     data: Annotated[
         str,
         typer.Argument(
-            help="Path to training data (.jsonl, .csv, or .parquet). Each row needs a 'text' column."
+            help="Path to training data (.jsonl, .csv, or .parquet). Supports 'text', 'messages', and 'prompt'+'response' column layouts."
         ),
     ],
     epochs: Annotated[
@@ -477,6 +500,34 @@ def learn(
             help="Enable gradient checkpointing to cut GPU memory ~40% at the cost of ~20% slower training.",
         ),
     ] = None,
+    watch_every: Annotated[
+        int | None,
+        typer.Option(
+            "--watch-every",
+            help="Run benchmarks and check for forgetting every N epochs during training.",
+        ),
+    ] = None,
+    watch_action: Annotated[
+        str,
+        typer.Option(
+            "--watch-action",
+            help="Action on forgetting: 'warn' (default), 'stop', or 'rollback'.",
+        ),
+    ] = "warn",
+    format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Training data format: 'auto' (default), 'text', 'messages', or 'prompt_response'.",
+        ),
+    ] = "auto",
+    messages_column: Annotated[
+        str,
+        typer.Option(
+            "--messages-column",
+            help="Column name holding chat messages when --format=messages (default: 'messages').",
+        ),
+    ] = "messages",
 ) -> None:
     """
     Fine-tune the model on a local dataset.
@@ -538,6 +589,11 @@ def learn(
             max_length=max_length,
             resume=resume,
             gradient_checkpointing=gradient_checkpointing,
+            tracker=tracker,
+            watch_every=watch_every,
+            watch_action=watch_action,
+            format=format,
+            messages_column=messages_column,
         )
     except PyrecallError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -624,6 +680,13 @@ def snapshot(
             help="Attach a key=value tag to this snapshot (repeatable), e.g. --tag commit=abc123f",
         ),
     ] = [],
+    benchmark_batch_size: Annotated[
+        int,
+        typer.Option(
+            "--benchmark-batch-size",
+            help="Number of benchmark prompts scored per forward pass (default 8). Set to 1 for sequential.",
+        ),
+    ] = 8,
 ) -> None:
     """
     Load the model, run all benchmarks, and save a named capability snapshot.
@@ -670,6 +733,7 @@ def snapshot(
         scoring_method=config.get("scoring_method", "log_likelihood"),
         snapshot_compression=compression,
         category_thresholds=config.get("category_thresholds", {}),
+        benchmark_batch_size=benchmark_batch_size,
     )
     tracker = _build_trackers(log_wandb, log_mlflow, log_neptune, neptune_project)
     model_obj.snapshot(name=name, tracker=tracker, dry_run=dry_run, tags=_parse_tags(tag))
@@ -691,7 +755,9 @@ def snapshot(
             console.print(f"[red]Error:[/red] Could not push to Hub: {exc}")
             raise typer.Exit(1)
 
-    if not no_update_baseline:
+    if dry_run:
+        pass  # dry-run never persists weights, so there is nothing to set as baseline
+    elif not no_update_baseline:
         config["baseline_snapshot"] = name
         _write_config(config)
         console.print(f"[dim]  Baseline updated to '{name}' in {_CONFIG_FILE}.[/dim]")
@@ -746,6 +812,13 @@ def check(
             "--output",
             "-o",
             help="Save the report to a file. Format inferred from extension: .html, .md, or .json.",
+        ),
+    ] = None,
+    save_report: Annotated[
+        str | None,
+        typer.Option(
+            "--save-report",
+            help="Alias for --output. Save the report to a file. Format inferred from extension: .html, .md, or .json.",
         ),
     ] = None,
     watch: Annotated[
@@ -848,19 +921,19 @@ def check(
                 return 1
             try:
                 snap_before = mgr.load_snapshot(before)
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError) as exc:
                 if ci:
-                    typer.echo(f"Error: Snapshot '{before}' not found.")
+                    typer.echo(f"Error: {exc}")
                 else:
-                    console.print(f"[red]Error:[/red] Snapshot '{before}' not found.")
+                    console.print(f"[red]Error:[/red] {exc}")
                 return 1
             try:
                 snap_after = mgr.load_snapshot(after)
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError) as exc:
                 if ci:
-                    typer.echo(f"Error: Snapshot '{after}' not found.")
+                    typer.echo(f"Error: {exc}")
                 else:
-                    console.print(f"[red]Error:[/red] Snapshot '{after}' not found.")
+                    console.print(f"[red]Error:[/red] {exc}")
                 return 1
 
         report = detector.compare(snap_before, snap_after)
@@ -870,13 +943,15 @@ def check(
         else:
             report.print(verbose=verbose)
 
-        if output:
+        # Use save_report as an alias for output if output is not provided
+        effective_output = output or save_report
+        if effective_output:
             try:
-                report.save(output)
+                report.save(effective_output)
                 if ci:
-                    typer.echo(f"Report saved to {output}")
+                    typer.echo(f"Report saved to {effective_output}")
                 else:
-                    console.print(f"[dim]Report saved to {output}[/dim]")
+                    console.print(f"[dim]Report saved to {effective_output}[/dim]")
             except ValueError as exc:
                 if ci:
                     typer.echo(f"Error: {exc}")
@@ -942,26 +1017,22 @@ def check(
                     if before is not None:
                         try:
                             snap_b = mgr.load_snapshot(before)
-                        except FileNotFoundError:
+                        except (FileNotFoundError, ValueError) as exc:
                             if ci:
-                                typer.echo(f"Snapshot '{before}' not found.")
+                                typer.echo(f"Error: {exc}")
                             else:
-                                console.print(
-                                    f"[dim][{ts}][/dim] [red]Snapshot '{before}' not found.[/red]"
-                                )
+                                console.print(f"[dim][{ts}][/dim] [red]Error: {exc}[/red]")
                             last_exit_code = 1
                             _failed = True
 
                     if after is not None:
                         try:
                             snap_a = mgr.load_snapshot(after)
-                        except FileNotFoundError:
+                        except (FileNotFoundError, ValueError) as exc:
                             if ci:
-                                typer.echo(f"Snapshot '{after}' not found.")
+                                typer.echo(f"Error: {exc}")
                             else:
-                                console.print(
-                                    f"[dim][{ts}][/dim] [red]Snapshot '{after}' not found.[/red]"
-                                )
+                                console.print(f"[dim][{ts}][/dim] [red]Error: {exc}[/red]")
                             last_exit_code = 1
                             _failed = True
 
@@ -970,6 +1041,26 @@ def check(
                         continue
 
                     report = detector.compare(snap_b, snap_a)
+                    # Use save_report as an alias for output if output is not provided
+                    effective_output = output or save_report
+                    if effective_output:
+                        try:
+                            report.save(effective_output)
+                            if ci:
+                                typer.echo(f"Report saved to {effective_output}")
+                            else:
+                                console.print(
+                                    f"[dim][{ts}][/dim] Report saved to {effective_output}"
+                                )
+                        except ValueError as exc:
+                            if ci:
+                                typer.echo(f"Error: {exc}")
+                            else:
+                                console.print(f"[dim][{ts}][/dim] [red]Error: {exc}[/red]")
+                            last_exit_code = 1
+                            time.sleep(interval)
+                            continue
+
                     if report.degraded_skills:
                         cats = ", ".join(
                             f"{c} ({next((x.severity for x in report.comparisons if x.category == c), 'UNKNOWN')})"
@@ -1059,13 +1150,13 @@ def diff(
 
     try:
         snap_before = mgr.load_snapshot(snap1)
-    except FileNotFoundError:
-        console.print(f"[red]Error:[/red] Snapshot '{snap1}' not found.")
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
     try:
         snap_after = mgr.load_snapshot(snap2)
-    except FileNotFoundError:
-        console.print(f"[red]Error:[/red] Snapshot '{snap2}' not found.")
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
 
     from pyrecall.detector import ForgettingDetector
@@ -1139,8 +1230,8 @@ def compare(
     for name in snapshots:
         try:
             loaded.append(mgr.load_snapshot(name))
-        except FileNotFoundError:
-            console.print(f"[red]Error:[/red] Snapshot '{name}' not found.")
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]Error:[/red] {exc}")
             raise typer.Exit(1)
 
     # Collect all category names in a stable order.
@@ -1150,13 +1241,16 @@ def compare(
             if cat not in all_cats:
                 all_cats.append(cat)
 
+    def _safe_round4(v: float) -> float | None:
+        return None if math.isnan(v) else round(v, 4)
+
     if json_output:
         out: dict = {
             "snapshots": [s.name for s in loaded],
             "categories": {
-                "overall": {s.name: round(s.overall_score(), 4) for s in loaded},
+                "overall": {s.name: _safe_round4(s.overall_score()) for s in loaded},
                 **{
-                    cat: {s.name: round(s.category_scores().get(cat, 0.0), 4) for s in loaded}
+                    cat: {s.name: _safe_round4(s.category_scores().get(cat, 0.0)) for s in loaded}
                     for cat in all_cats
                 },
             },
@@ -1173,14 +1267,18 @@ def compare(
         table.add_column(snap.name, justify="right")
 
     def _fmt_row(label: str, values: list[float]) -> None:
-        best = max(values)
-        worst = min(values)
+        finite = [v for v in values if not math.isnan(v)]
+        best = max(finite) if finite else None
+        worst = min(finite) if finite else None
         cells: list[str] = [label]
         for v in values:
+            if math.isnan(v):
+                cells.append("-")
+                continue
             s = f"{v:.3f}"
-            if v == best and best != worst:
+            if best != worst and v == best:
                 cells.append(f"[green]{s}[/green]")
-            elif v == worst and best != worst:
+            elif best != worst and v == worst:
                 cells.append(f"[red]{s}[/red]")
             else:
                 cells.append(s)
@@ -1286,6 +1384,229 @@ def _human_size(n: int) -> str:
     if n >= 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n} B"
+
+
+def _write_status_output(
+    snapshots: list,
+    model_name: str | None,
+    baseline: str | None,
+    path: str,
+) -> None:
+    """Write status output to a file in JSON, CSV, or HTML format.
+
+    Format is inferred from the file extension (.json, .csv, .html).
+    """
+    from pathlib import Path as _Path
+
+    out = _Path(path)
+    fmt = out.suffix.lstrip(".").lower()
+
+    if fmt in ("htm", "html"):
+        content = _status_to_html(snapshots, model_name, baseline)
+    elif fmt == "csv":
+        content = _status_to_csv(snapshots, baseline)
+    elif fmt == "json":
+        content = _status_to_json(snapshots, model_name, baseline)
+    else:
+        raise ValueError(
+            f"Unknown format '{fmt}'. Use 'html', 'csv', or 'json' "
+            "(or give the file a recognised extension)."
+        )
+    try:
+        out.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Could not write to '{path}': {exc}") from exc
+    console.print(f"[green]✓ Status saved to[/green] [bold]{path}[/bold]")
+
+
+def _status_to_json(
+    snapshots: list,
+    model_name: str | None,
+    baseline: str | None,
+) -> str:
+    """Return status data as JSON string."""
+
+    def _nan_safe(v: float) -> float | None:
+        return None if math.isnan(v) else v
+
+    out = {
+        "model_name": model_name,
+        "baseline_snapshot": baseline,
+        "snapshots": [
+            {
+                "name": snap.name,
+                "created_at": snap.created_at.isoformat(),
+                "overall": _nan_safe(snap.overall_score()),
+                "scores": {k: _nan_safe(v) for k, v in snap.category_scores().items()},
+                "adapter_ok": bool(snap.adapter_path and snap.adapter_path.exists()),
+                "is_baseline": snap.name == baseline,
+                "hub_repo": snap.hub_repo,
+                "tags": snap.tags,
+            }
+            for snap in snapshots
+        ],
+    }
+    return json.dumps(out, indent=2)
+
+
+def _status_to_csv(snapshots: list, baseline: str | None) -> str:
+    """Return status data as CSV string."""
+    from io import StringIO
+
+    # Collect all category names in a stable order.
+    all_categories: list[str] = []
+    for snap in snapshots:
+        for cat in snap.category_scores():
+            if cat not in all_categories:
+                all_categories.append(cat)
+
+    fieldnames = (
+        ["name", "created_at", "overall", "is_baseline"]
+        + all_categories
+        + ["adapter_ok", "hub_repo", "tags"]
+    )
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for snap in snapshots:
+        cat_scores = snap.category_scores()
+        overall = snap.overall_score()
+        row: dict = {
+            "name": snap.name,
+            "created_at": snap.created_at.isoformat(),
+            "overall": "" if math.isnan(overall) else round(overall, 4),
+            "is_baseline": "true" if snap.name == baseline else "false",
+            "adapter_ok": "true" if (snap.adapter_path and snap.adapter_path.exists()) else "false",
+            "hub_repo": snap.hub_repo or "",
+            "tags": ", ".join(f"{k}={v}" for k, v in snap.tags.items()) if snap.tags else "",
+        }
+        for cat in all_categories:
+            v = cat_scores.get(cat)
+            row[cat] = "" if v is None or math.isnan(v) else round(v, 4)
+        writer.writerow(row)
+
+    return output.getvalue()
+
+
+def _status_to_html(snapshots: list, model_name: str | None, baseline: str | None) -> str:
+    """Return status data as an HTML table."""
+    import html as _html
+
+    if not snapshots:
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pyrecall — Status</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    background:#ffffff;color:#24292f;max-width:860px;margin:40px auto;padding:0 24px}}
+  h1{{font-size:1.5rem;margin-bottom:4px}}
+  .meta{{color:#57606a;font-size:.875rem;margin-bottom:24px}}
+</style>
+</head>
+<body>
+<h1>pyrecall — Status</h1>
+<p class="meta">Model: {model_name or "unknown"}</p>
+<p>No snapshots found.</p>
+</body>
+</html>"""
+
+    # Collect all category names in a stable order.
+    all_categories: list[str] = []
+    for snap in snapshots:
+        for cat in snap.category_scores():
+            if cat not in all_categories:
+                all_categories.append(cat)
+
+    # Build table rows.
+    table_rows: list[str] = []
+    for snap in snapshots:
+        cat_scores = snap.category_scores()
+        is_baseline = snap.name == baseline
+        name_cell = f"<strong>{_html.escape(snap.name)}</strong>"
+        if is_baseline:
+            name_cell = f'<span style="color:#2da44e;font-weight:600;">{name_cell} ★</span>'
+        if snap.hub_repo:
+            name_cell += ' <span style="color:#0969da;font-size:.875rem;">[hub]</span>'
+
+        overall = snap.overall_score()
+        overall_str = "n/a" if math.isnan(overall) else f"{overall:.3f}"
+
+        cells = [
+            f"<td>{name_cell}</td>",
+            f"<td>{snap.created_at.strftime('%Y-%m-%d %H:%M')}</td>",
+            f"<td style='text-align:right;'>{overall_str}</td>",
+        ]
+        for cat in all_categories:
+            v = cat_scores.get(cat)
+            cell_val = "n/a" if v is None or math.isnan(v) else f"{v:.3f}"
+            cells.append(f"<td style='text-align:right;'>{cell_val}</td>")
+        cells.append(
+            f"<td style='text-align:center;'>{'✓' if (snap.adapter_path and snap.adapter_path.exists()) else '✗'}</td>"
+        )
+        cells.append(f"<td>{_html.escape(snap.hub_repo) if snap.hub_repo else ''}</td>")
+        tags_str = ", ".join(f"{k}={v}" for k, v in snap.tags.items()) if snap.tags else ""
+        cells.append(f"<td>{_html.escape(tags_str)}</td>")
+        table_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    # Build header cells.
+    header_cells = [
+        "<th>Name</th>",
+        "<th>Created</th>",
+        "<th style='text-align:right;'>Overall</th>",
+    ]
+    for cat in all_categories:
+        header_cells.append(
+            f"<th style='text-align:right;'>{_html.escape(cat.replace('_', ' ').title())}</th>"
+        )
+    header_cells.append("<th style='text-align:center;'>Adapter</th>")
+    header_cells.append("<th>Hub Repo</th>")
+    header_cells.append("<th>Tags</th>")
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pyrecall — Status</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    background:#ffffff;color:#24292f;max-width:100%;margin:40px auto;padding:0 24px}}
+  h1{{font-size:1.5rem;margin-bottom:4px}}
+  .meta{{color:#57606a;font-size:.875rem;margin-bottom:24px}}
+  table{{width:100%;border-collapse:collapse;margin-top:20px;font-size:.875rem}}
+  th{{background:#f6f8fa;text-align:left;padding:8px 12px;border:1px solid #d0d7de;
+    font-weight:600}}
+  td{{padding:7px 12px;border:1px solid #d0d7de}}
+  tr:hover td{{background:#f6f8fa}}
+  footer{{margin-top:36px;font-size:.75rem;color:#57606a}}
+</style>
+</head>
+<body>
+<h1>pyrecall — Status</h1>
+<p class="meta">
+  Model: {model_name or "unknown"} &nbsp;|&nbsp;
+  Generated: {ts} &nbsp;|&nbsp;
+  Baseline: {baseline or "none"}
+</p>
+<table>
+<thead>
+<tr>
+  {"".join(header_cells)}
+</tr>
+</thead>
+<tbody>
+{"".join(table_rows)}
+</tbody>
+</table>
+<footer>
+  Generated by <a href="https://github.com/Pyrecall/Pyrecall">pyrecall</a>
+</footer>
+</body>
+</html>"""
 
 
 @app.command()
@@ -1454,25 +1775,48 @@ def status(
         bool,
         typer.Option("--json", help="Output results as JSON instead of a rich table."),
     ] = False,
+    output: Annotated[
+        str | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Save the report to a file. Format inferred from extension: .csv, .html, or .json.",
+        ),
+    ] = None,
 ) -> None:
-    """Show all saved snapshots and their per-category skill scores."""
+    """
+    Show all saved snapshots and their per-category skill scores.
+
+    Use --output to save the report to a file:
+
+        pyrecall status --output status.csv
+        pyrecall status --output status.json
+        pyrecall status --output status.html
+    """
     config = _read_config()
     mgr = _build_rollback_manager(config)
     all_snaps = mgr.list_snapshots()
-
-    if not all_snaps:
-        if json_output:
-            typer.echo(json.dumps({"model_name": config.get("model_name"), "snapshots": []}))
-        else:
-            console.print(
-                "[yellow]No snapshots found.[/yellow] "
-                "Run [bold]pyrecall snapshot <name>[/bold] to create one."
-            )
-        return
-
     baseline = config.get("baseline_snapshot")
 
+    # If --output is specified, write to file and return
+    if output:
+        try:
+            _write_status_output(
+                all_snaps,
+                config.get("model_name"),
+                baseline,
+                output,
+            )
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(1)
+        return
+
     if json_output:
+
+        def _nan_safe(v: float) -> float | None:
+            return None if math.isnan(v) else v
+
         out = {
             "model_name": config.get("model_name"),
             "baseline_snapshot": baseline,
@@ -1480,8 +1824,8 @@ def status(
                 {
                     "name": snap.name,
                     "created_at": snap.created_at.isoformat(),
-                    "overall": snap.overall_score(),
-                    "scores": snap.category_scores(),
+                    "overall": _nan_safe(snap.overall_score()),
+                    "scores": {k: _nan_safe(v) for k, v in snap.category_scores().items()},
                     "adapter_ok": bool(snap.adapter_path and snap.adapter_path.exists()),
                     "is_baseline": snap.name == baseline,
                     "hub_repo": snap.hub_repo,
@@ -1491,6 +1835,13 @@ def status(
             ],
         }
         typer.echo(json.dumps(out, indent=2))
+        return
+
+    if not all_snaps:
+        console.print(
+            "[yellow]No snapshots found.[/yellow] "
+            "Run [bold]pyrecall snapshot <name>[/bold] to create one."
+        )
         return
 
     # Collect all category names from any snapshot for column headers.
@@ -1616,6 +1967,10 @@ def history(
             category_thresholds=config.get("category_thresholds", {}),
         )
 
+        def _safe_overall(snap) -> float | None:
+            v = snap.overall_score()
+            return None if math.isnan(v) else round(v, 4)
+
         health_rows: list[dict] = []
         for i, snap in enumerate(snaps):
             is_baseline = snap.name == baseline
@@ -1624,7 +1979,7 @@ def history(
                     {
                         "name": snap.name,
                         "created_at": snap.created_at.isoformat(),
-                        "overall": round(snap.overall_score(), 4),
+                        "overall": _safe_overall(snap),
                         "status": "first",
                         "degraded_skills": [],
                         "notes": "(baseline)" if is_baseline else "(first snapshot)",
@@ -1636,6 +1991,8 @@ def history(
                 _comp_map = {x.category: x for x in report.comparisons}
                 dropped_notes = [
                     f"{c} {_comp_map[c].delta:+.3f}"
+                    if not math.isnan(_comp_map[c].delta)
+                    else f"{c} (n/a)"
                     for c in report.degraded_skills
                     if c in _comp_map
                 ]
@@ -1643,7 +2000,7 @@ def history(
                     {
                         "name": snap.name,
                         "created_at": snap.created_at.isoformat(),
-                        "overall": round(snap.overall_score(), 4),
+                        "overall": _safe_overall(snap),
                         "status": "degraded" if report.degraded_skills else "healthy",
                         "degraded_skills": report.degraded_skills,
                         "notes": ", ".join(dropped_notes) if dropped_notes else "",
@@ -1690,7 +2047,7 @@ def history(
             table.add_row(
                 name_str,
                 hr["created_at"][:16].replace("T", " "),
-                f"{hr['overall']:.3f}",
+                "-" if hr["overall"] is None else f"{hr['overall']:.3f}",
                 status_str,
                 notes,
             )
@@ -1742,9 +2099,14 @@ def history(
         prev = snaps[i - 1].category_scores() if i > 0 else None
         prev_overall = snaps[i - 1].overall_score() if i > 0 else None
 
-        overall_str = f"{snap.overall_score():.3f}"
-        if prev_overall is not None:
-            overall_str += f" {_trend(prev_overall, snap.overall_score())}"
+        curr_overall = snap.overall_score()
+        overall_str = "-" if math.isnan(curr_overall) else f"{curr_overall:.3f}"
+        if (
+            prev_overall is not None
+            and not math.isnan(curr_overall)
+            and not math.isnan(prev_overall)
+        ):
+            overall_str += f" {_trend(prev_overall, curr_overall)}"
 
         name_markup = (
             f"[bold green]{snap.name} ★[/bold green]" if snap.name == baseline else snap.name
@@ -1760,8 +2122,13 @@ def history(
                 row.append("-")
                 continue
             score = cat_scores[cat]
-            cell = f"{score:.3f}"
-            if prev is not None and cat in prev:
+            cell = "-" if math.isnan(score) else f"{score:.3f}"
+            if (
+                prev is not None
+                and cat in prev
+                and not math.isnan(score)
+                and not math.isnan(prev[cat])
+            ):
                 cell += f" {_trend(prev[cat], score)}"
             row.append(cell)
 
@@ -1772,19 +2139,20 @@ def history(
     # Summary line: overall drift from first to last shown snapshot.
     first_overall = snaps[0].overall_score()
     last_overall = snaps[-1].overall_score()
-    delta = last_overall - first_overall
-    direction = (
-        "[green]improved[/green]"
-        if delta > 0
-        else "[red]dropped[/red]"
-        if delta < 0
-        else "unchanged"
-    )
-    console.print(
-        f"\n  Overall score {direction} by [bold]{abs(delta):.3f}[/bold] "
-        f"across {len(snaps)} snapshots "
-        f"({snaps[0].name} → {snaps[-1].name})."
-    )
+    if not math.isnan(first_overall) and not math.isnan(last_overall):
+        delta = last_overall - first_overall
+        direction = (
+            "[green]improved[/green]"
+            if delta > 0
+            else "[red]dropped[/red]"
+            if delta < 0
+            else "unchanged"
+        )
+        console.print(
+            f"\n  Overall score {direction} by [bold]{abs(delta):.3f}[/bold] "
+            f"across {len(snaps)} snapshots "
+            f"({snaps[0].name} → {snaps[-1].name})."
+        )
     if baseline:
         console.print(f"[dim]  ★ = current baseline ({baseline})[/dim]")
 
@@ -2454,9 +2822,11 @@ def pull(
             mgr.base_dir,
             include_weights=not no_weights,
         )
+        overall = snap.overall_score()
+        overall_str = "-" if math.isnan(overall) else f"{overall:.3f}"
         console.print(
             f"[success]✓ Snapshot '{name}' pulled from {repo_id}. "
-            f"Overall score: {snap.overall_score():.3f}[/success]"
+            f"Overall score: {overall_str}[/success]"
         )
     except ImportError as exc:
         console.print(f"[red]Error:[/red] {exc}")
